@@ -82,6 +82,10 @@ _MIGRATIONS = [
     "ALTER TABLE cards ADD COLUMN lev           TEXT NOT NULL DEFAULT 'gold'",
     "ALTER TABLE cards ADD COLUMN buy_price_min INTEGER DEFAULT 700",
     "ALTER TABLE cards ADD COLUMN buy_price_max INTEGER DEFAULT 850",
+    # Legacy buy_price column — set_card still writes it, but _SCHEMA no longer
+    # defines it, so databases created from the current schema were missing it
+    # and every /setcard INSERT failed (leaving the old card config active).
+    "ALTER TABLE cards ADD COLUMN buy_price INTEGER NOT NULL DEFAULT 0",
     # Back-fill buy_price_max from the legacy buy_price column for existing rows
     "UPDATE cards SET buy_price_max = buy_price WHERE buy_price_max = 0 AND buy_price > 0",
     # Player name per transaction
