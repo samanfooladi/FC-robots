@@ -51,6 +51,7 @@ async def send_order_complete(
     """
     import time as _time
 
+    logger.info("Sending completion message to %s", client_telegram_id)
     lines = ["✅ <b>سفارش شما آماده شد!</b>\n"]
     for t in transactions:
         name = t.get("player_name") or t.get("card_name", "—")

@@ -180,13 +180,23 @@ class OrderWorker:
         await update_order_status(order_id, "done")
         logger.info("Order #%d complete — %d cards listed", order_id, quantity)
 
-        transactions = await get_transactions_for_order(order_id)
-        await send_order_complete(
-            bot=self.bot,
-            client_telegram_id=client_telegram_id,
-            order_id=order_id,
-            transactions=transactions,
-        )
+        try:
+            transactions = await get_transactions_for_order(order_id)
+            logger.info(
+                "Order #%d complete. client_id=%s transactions=%d",
+                order_id, client_telegram_id, len(transactions),
+            )
+            await send_order_complete(
+                bot=self.bot,
+                client_telegram_id=client_telegram_id,
+                order_id=order_id,
+                transactions=transactions,
+            )
+        except Exception:
+            logger.exception(
+                "Order #%d: failed to send completion notification to client %s",
+                order_id, client_telegram_id,
+            )
 
     async def _do_process(
         self,
@@ -203,6 +213,19 @@ class OrderWorker:
         card_name: str = card_config["card_name"]
         list_price: int = card_config["list_price"]
         start_bid: int = card_config["start_bid"]
+
+        logger.info(
+            "Order #%d card config: name=%s list_price=%d start_bid=%d "
+            "buy_range=%d-%d rating=%s-%s",
+            order_id, card_name, list_price, start_bid,
+            card_config.get("buy_price_min", 0), card_config.get("buy_price_max", 0),
+            card_config.get("min_rating"), card_config.get("max_rating"),
+        )
+
+        if list_price <= 0:
+            raise _OrderAborted(
+                f"list_price={list_price} is invalid — re-run /setcard to fix the card config"
+            )
 
         search_misses = 0          # consecutive empty searches
         consecutive_buy_fails = 0  # consecutive buy errors
@@ -322,6 +345,10 @@ class OrderWorker:
             await asyncio.sleep(2)
 
             # ── LIST ──────────────────────────────────────────────────────────
+            logger.info(
+                "About to list item=%d buy_now=%d start_bid=%d",
+                result.item_id, list_price, start_bid,
+            )
             list_result = await list_card(
                 self.session,
                 result.item_id,
