@@ -36,6 +36,7 @@ from db.database import (
 )
 from market.buyer import buy_card, search_card
 from market.lister import list_card, move_to_tradepile
+from market.player_names import get_player_name
 from bot.notifications import send_card_listed, send_order_complete, safe_send
 from utils.delays import human_delay
 
@@ -321,7 +322,13 @@ class OrderWorker:
 
             # Persist immediately — if we crash now the restart counter
             # will skip this card.
-            player_name = cheapest.player_name or card_name
+            # The market API itself carries no names; resolve via the EA
+            # players.json metadata, falling back to the configured card name.
+            player_name = (
+                cheapest.player_name
+                or await get_player_name(cheapest.resource_id)
+                or card_name
+            )
             await save_transaction(
                 order_id=order_id,
                 card_name=card_name,
