@@ -97,18 +97,20 @@ async def cmd_order(
     if not card:
         await message.reply("⚠️ No card is currently configured. Ask an admin to /setcard first.")
         return
-    if card["buy_price"] <= 0:
-        await message.reply("⚠️ Buy price is not set. Ask an admin to /setbuyprice first.")
+    if card["buy_price_max"] <= 0:
+        await message.reply("⚠️ Buy price is not set. Ask an admin to /setcard first.")
         return
     if card["list_price"] <= 0:
-        await message.reply("⚠️ List price is not set. Ask an admin to /setlistprice first.")
+        await message.reply("⚠️ List price is not set. Ask an admin to /setcard first.")
         return
 
     # ── Check budget covers at least one card ─────────────────────────────
-    if amount < card["buy_price"]:
+    # create_order derives quantity from buy_price_max, so validate against
+    # the same column (the legacy buy_price column may be absent or 0).
+    if amount < card["buy_price_max"]:
         await message.reply(
             f"❌ Order amount ({amount:,}) is less than the current buy price "
-            f"({card['buy_price']:,}). Please increase your order amount."
+            f"({card['buy_price_max']:,}). Please increase your order amount."
         )
         return
 
@@ -136,7 +138,7 @@ async def cmd_order(
         f"✅ Order received for <b>{amount:,}</b> coins.\n\n"
         f"Card: <b>{card['card_name']}</b>\n"
         f"Cards to buy: <b>{order['quantity']}</b>\n"
-        f"Buy price cap: <b>{card['buy_price']:,}</b>\n\n"
+        f"Buy price cap: <b>{card['buy_price_max']:,}</b>\n\n"
         "Please wait while we process your cards. "
         "You will be notified when your cards are listed.",
         parse_mode="HTML",

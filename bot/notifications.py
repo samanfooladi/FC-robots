@@ -24,19 +24,28 @@ def _fmt_ts(unix: float) -> str:
     return datetime.utcfromtimestamp(unix).strftime("%Y-%m-%d %H:%M UTC")
 
 
-async def safe_send(bot: Bot, chat_id: int, text: str) -> None:
-    """Send a message; log and skip if the user has blocked the bot."""
+async def safe_send(bot: Bot, chat_id: int, text: str) -> bool:
+    """
+    Send a message; log and skip if the user has blocked the bot.
+    Returns True when the message was actually delivered to Telegram.
+    """
     try:
         await bot.send_message(chat_id, text, parse_mode="HTML")
+        return True
     except TelegramForbiddenError:
         logger.warning("Cannot send to %d — user has blocked the bot", chat_id)
     except TelegramBadRequest as exc:
         logger.warning("Bad request sending to %d: %s", chat_id, exc)
+    return False
 
 
 # ---------------------------------------------------------------------------
 # Order completion
 # ---------------------------------------------------------------------------
+
+
+# Telegram rejects messages longer than this with TelegramBadRequest.
+_TELEGRAM_MAX_MESSAGE_LEN = 4096
 
 
 async def send_order_complete(
@@ -48,18 +57,33 @@ async def send_order_complete(
     """
     Notify a client that their order has been fully processed.
     *transactions* is the list returned by get_transactions_for_order().
+
+    Large orders (100+ cards) produce more text than fits in one Telegram
+    message, so the per-card blocks are split across as many messages as
+    needed — otherwise the whole notification is rejected with
+    TelegramBadRequest and the client receives nothing.
     """
     import time as _time
+    from html import escape
 
     logger.info("Sending completion message to %s", client_telegram_id)
-    lines = ["✅ <b>سفارش شما آماده شد!</b>\n"]
+
+    if not client_telegram_id:
+        logger.error(
+            "Order #%d: client_telegram_id is %r — cannot send completion message",
+            order_id,
+            client_telegram_id,
+        )
+        return
+
+    blocks: list[str] = []
     for t in transactions:
-        name = t.get("player_name") or t.get("card_name", "—")
+        name = escape(t.get("player_name") or t.get("card_name", "—"))
         bought = t["bought_price"]
         buy_now = t["listed_price"]
         # EA bid increment for 1000-10000 range is 100 coins
         start_bid = (int(buy_now * 0.95) // 100) * 100
-        lines.append(
+        blocks.append(
             f"👤 {name}\n"
             f"📦 تعداد: 1\n"
             f"💰 خریداری شده: {bought:,}\n"
@@ -69,17 +93,42 @@ async def send_order_complete(
         )
 
     ts = _fmt_ts(transactions[-1]["listed_at"] if transactions else _time.time())
-    lines.append(f"📊 جمع کل: {len(transactions)} کارت")
-    lines.append(f"⏰ {ts}")
+    blocks.append(f"📊 جمع کل: {len(transactions)} کارت\n⏰ {ts}")
 
-    text = "\n".join(lines)
-    await safe_send(bot, client_telegram_id, text)
-    logger.info(
-        "Order-complete notification sent to client %d (%d cards, order #%d)",
-        client_telegram_id,
-        len(transactions),
-        order_id,
-    )
+    # Pack the blocks into as few messages as possible, each under the limit.
+    chunks: list[str] = []
+    current = "✅ <b>سفارش شما آماده شد!</b>\n"
+    for block in blocks:
+        candidate = f"{current}\n{block}"
+        if len(candidate) > _TELEGRAM_MAX_MESSAGE_LEN:
+            chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    chunks.append(current)
+
+    delivered = 0
+    for chunk in chunks:
+        if await safe_send(bot, client_telegram_id, chunk):
+            delivered += 1
+
+    if delivered == len(chunks):
+        logger.info(
+            "Order-complete notification sent to client %d (%d cards, order #%d, %d message(s))",
+            client_telegram_id,
+            len(transactions),
+            order_id,
+            len(chunks),
+        )
+    else:
+        logger.error(
+            "Order-complete notification only partially delivered to client %s "
+            "(order #%d): %d/%d message(s) sent",
+            client_telegram_id,
+            order_id,
+            delivered,
+            len(chunks),
+        )
 
 
 # ---------------------------------------------------------------------------
