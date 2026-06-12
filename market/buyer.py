@@ -67,6 +67,7 @@ def _parse_listings(raw: dict) -> list[CardListing]:
                 resource_id=int(item.get("resourceId", item.get("maskedDefId", 0))),
                 start_price=int(auction.get("startingBid", 0)),
                 player_name=player_name,
+                rating=int(item.get("rating", 0)),
             )
         )
     return sorted(listings, key=lambda c: c.buy_now_price)
@@ -98,14 +99,21 @@ async def search_card(
         "lev": card_config["lev"],
         "maxb": card_config["buy_price_max"],
     }
+    # Both spellings are sent because EA silently drops parameters it does
+    # not recognise — but the rating range is ultimately enforced locally
+    # below, so an ignored parameter can never lead to a wrong-rated buy.
     if card_config.get("min_rating"):
         params["minrating"] = card_config["min_rating"]
+        params["minovr"] = card_config["min_rating"]
     if card_config.get("max_rating"):
         params["maxrating"] = card_config["max_rating"]
+        params["maxovr"] = card_config["max_rating"]
     if card_config.get("resource_id"):
         params["maskedDefId"] = card_config["resource_id"]
 
     buy_price_min: int = card_config.get("buy_price_min", 0)
+    min_rating: int = card_config.get("min_rating") or 0
+    max_rating: int = card_config.get("max_rating") or 0
     card_name: str = card_config.get("card_name", "?")
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -141,12 +149,29 @@ async def search_card(
 
             resp.raise_for_status()
             all_listings = _parse_listings(resp.json())
-            listings = [l for l in all_listings if l.buy_now_price >= buy_price_min]
+            listings = []
+            for l in all_listings:
+                if l.buy_now_price < buy_price_min:
+                    continue
+                # Local rating check — when a rating range is configured,
+                # a listing without rating data is rejected too: buying an
+                # unverifiable card is worse than skipping it.
+                if (min_rating or max_rating) and not l.rating:
+                    continue
+                if min_rating and l.rating < min_rating:
+                    continue
+                if max_rating and l.rating > max_rating:
+                    continue
+                listings.append(l)
             logger.info(
-                "search_card: %d listing(s) in range [%d-%d] for %s (cheapest=%s)",
+                "search_card: %d/%d listing(s) match price [%d-%d] rating [%s-%s] "
+                "for %s (cheapest=%s)",
                 len(listings),
+                len(all_listings),
                 buy_price_min,
                 card_config["buy_price_max"],
+                min_rating or "—",
+                max_rating or "—",
                 card_name,
                 listings[0].buy_now_price if listings else "—",
             )

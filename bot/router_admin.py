@@ -113,7 +113,8 @@ async def cmd_setcard(message: Message, command: CommandObject) -> None:
         return
 
     min_rating, max_rating, buy_min, buy_max, list_price = (int(p) for p in rest)
-    start_bid = int(list_price * 0.95)
+    # Must match the rounding in db.set_card — floor to a 100-coin tier
+    start_bid = (int(list_price * 0.95) // 100) * 100
 
     card_id = await set_card(
         card_name=card_name,

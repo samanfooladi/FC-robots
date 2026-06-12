@@ -10,6 +10,7 @@ class CardListing:
     resource_id: int   # itemData.resourceId / maskedDefId — the player template
     start_price: int   # current / starting bid
     player_name: str = ""  # commonName / lastName from itemData, empty if absent
+    rating: int = 0    # itemData.rating — player overall, 0 if absent
 
 
 @dataclass

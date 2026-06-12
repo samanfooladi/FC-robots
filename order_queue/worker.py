@@ -36,7 +36,7 @@ from db.database import (
 )
 from market.buyer import buy_card, search_card
 from market.lister import list_card, move_to_tradepile
-from bot.notifications import send_order_complete, safe_send
+from bot.notifications import send_card_listed, send_order_complete, safe_send
 from utils.delays import human_delay
 
 logger = logging.getLogger(__name__)
@@ -168,11 +168,20 @@ class OrderWorker:
         except _OrderAborted as exc:
             logger.error("Order #%d aborted: %s", order_id, exc.reason)
             await update_order_status(order_id, "failed")
+            # _do_process tracks progress in a local copy — recount from the
+            # DB so the abort messages show the real number of bought cards.
+            cards_bought = await count_transactions_for_order(order_id)
             await self._notify_admins(
                 f"❌ <b>Order #{order_id} failed</b>\n"
                 f"Card: {card_name}\n"
                 f"Reason: {exc.reason}\n"
                 f"Cards bought before abort: {cards_bought}"
+            )
+            await safe_send(
+                self.bot,
+                client_telegram_id,
+                f"⚠️ سفارش شما متوقف شد — {cards_bought} از {quantity} کارت لیست شد.\n"
+                "لطفاً با ادمین تماس بگیرید.",
             )
             return
 
@@ -382,6 +391,26 @@ class OrderWorker:
                     list_result.trade_id,
                     list_price,
                 )
+                # Tell the client right away — the final summary only goes
+                # out once the whole order is done, which can take a while.
+                try:
+                    await send_card_listed(
+                        bot=self.bot,
+                        client_telegram_id=card_config["client_telegram_id"],
+                        player_name=player_name,
+                        # lister floors the bid to a 100-coin tier; show the
+                        # same value the auction actually uses
+                        start_bid=(start_bid // 100) * 100,
+                        buy_now=list_price,
+                        cards_done=cards_bought,
+                        total=quantity,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Order #%d: could not send card-listed message to client",
+                        order_id,
+                        exc_info=True,
+                    )
             else:
                 logger.warning(
                     "Order #%d: item=%d bought but listing failed: %s",
