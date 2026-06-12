@@ -40,6 +40,33 @@ async def safe_send(bot: Bot, chat_id: int, text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Per-card listing notification
+# ---------------------------------------------------------------------------
+
+
+async def send_card_listed(
+    bot: Bot,
+    client_telegram_id: int,
+    player_name: str,
+    start_bid: int,
+    buy_now: int,
+    cards_done: int,
+    total: int,
+) -> None:
+    """Notify the client that one card of their order is now listed."""
+    from html import escape
+
+    text = (
+        f"🟢 <b>کارت شما لیست شد</b> ({cards_done}/{total})\n\n"
+        f"👤 {escape(player_name)}\n"
+        f"📦 تعداد: 1\n"
+        f"🏷 Start Bid: {start_bid:,}\n"
+        f"💵 Buy Now: {buy_now:,}"
+    )
+    await safe_send(bot, client_telegram_id, text)
+
+
+# ---------------------------------------------------------------------------
 # Order completion
 # ---------------------------------------------------------------------------
 
