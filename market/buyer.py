@@ -35,6 +35,9 @@ MAX_RETRIES = 3
 # HTTP status codes that are worth retrying
 _RETRYABLE = {429, 500, 502, 503, 504}
 
+# Diagnostic: log the raw itemData of the first listing seen, once per process.
+_logged_item_sample = False
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,8 +50,19 @@ def _build_headers(session: SessionData) -> dict[str, str]:
 
 def _parse_listings(raw: dict) -> list[CardListing]:
     """Turn the raw auctionInfo list into typed CardListing objects."""
+    global _logged_item_sample
     listings: list[CardListing] = []
-    for auction in raw.get("auctionInfo", []):
+    auctions = raw.get("auctionInfo", [])
+    # One-time diagnostic: dump the raw itemData so we can see exactly which
+    # fields EA returns (player name source, id fields, rating, …).
+    if auctions and not _logged_item_sample:
+        _logged_item_sample = True
+        import json as _json
+        logger.info(
+            "search_card RAW itemData sample: %s",
+            _json.dumps(auctions[0].get("itemData", {}), ensure_ascii=False),
+        )
+    for auction in auctions:
         item = auction.get("itemData", {})
         buy_now = auction.get("buyNowPrice", 0)
         if buy_now <= 0:

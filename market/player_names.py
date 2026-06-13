@@ -17,14 +17,19 @@ keeps working, only the displayed name is less specific.
 
 import asyncio
 import logging
+import os
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# The content GUID has been stable across game years; the year segment and
-# site section have not, so several candidates are tried in order.
+# The exact URL changes every game year.  Set PLAYERS_JSON_URL in the
+# environment to the file the web app actually loads (find it in the
+# browser's DevTools → Network tab) — that always takes priority.
+# The hard-coded candidates below are best-effort fallbacks.
 _PLAYERS_URLS = [
+    u for u in [os.getenv("PLAYERS_JSON_URL", "").strip()] if u
+] + [
     "https://www.ea.com/fifa/ultimate-team/web-app/content/"
     "21D4F1AC-91A3-458D-A64E-895AA6D871D1/2026/fut/items/web/players.json",
     "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/content/"
@@ -64,12 +69,22 @@ async def _download() -> dict[int, str] | None:
                 logger.warning("players.json: HTTP %d from %s", resp.status_code, url)
                 continue
             body = resp.json()
-            names: dict[int, str] = {}
+            players = []
             for section in ("Players", "LegendsPlayers"):
-                for player in body.get(section, []):
-                    pid = player.get("id")
-                    if pid is not None:
-                        names[int(pid)] = _pick_name(player)
+                players.extend(body.get(section, []))
+            if players:
+                # Diagnostic: show the shape of one entry so the name fields
+                # (and whether they are strings or index ids) are visible.
+                import json as _json
+                logger.info(
+                    "players.json: sample entry from %s: %s",
+                    url, _json.dumps(players[0], ensure_ascii=False)[:500],
+                )
+            names: dict[int, str] = {}
+            for player in players:
+                pid = player.get("id")
+                if pid is not None:
+                    names[int(pid)] = _pick_name(player)
             if names:
                 logger.info("players.json: loaded %d player names from %s", len(names), url)
                 return names
