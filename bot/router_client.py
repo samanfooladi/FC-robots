@@ -105,12 +105,12 @@ async def cmd_order(
         return
 
     # ── Check budget covers at least one card ─────────────────────────────
-    # create_order derives quantity from buy_price_max, so validate against
-    # the same column (the legacy buy_price column may be absent or 0).
-    if amount < card["buy_price_max"]:
+    # create_order derives quantity from list_price (what one card costs
+    # the client), so validate against the same column.
+    if amount < card["list_price"]:
         await message.reply(
-            f"❌ Order amount ({amount:,}) is less than the current buy price "
-            f"({card['buy_price_max']:,}). Please increase your order amount."
+            f"❌ Order amount ({amount:,}) is less than the list price of one card "
+            f"({card['list_price']:,}). Please increase your order amount."
         )
         return
 
@@ -138,7 +138,7 @@ async def cmd_order(
         f"✅ Order received for <b>{amount:,}</b> coins.\n\n"
         f"Card: <b>{card['card_name']}</b>\n"
         f"Cards to buy: <b>{order['quantity']}</b>\n"
-        f"Buy price cap: <b>{card['buy_price_max']:,}</b>\n\n"
+        f"List price per card: <b>{card['list_price']:,}</b>\n\n"
         "Please wait while we process your cards. "
         "You will be notified when your cards are listed.",
         parse_mode="HTML",

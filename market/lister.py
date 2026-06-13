@@ -92,7 +92,20 @@ async def move_to_tradepile(
                 return False
 
             resp.raise_for_status()
-            logger.info("move_to_tradepile SUCCESS item_id=%d", item_id)
+            # Confirm the item is actually reported in the trade pile — a 200
+            # that lists the item under a different pile means the move did not
+            # take, and the subsequent list_card would have nothing to sell.
+            moved_pile = ""
+            try:
+                returned = resp.json().get("itemData", [{}])
+                if returned:
+                    moved_pile = returned[0].get("pile", "")
+            except Exception:
+                pass
+            logger.info(
+                "move_to_tradepile SUCCESS item_id=%d (reported pile=%r) raw=%s",
+                item_id, moved_pile, resp.text[:300],
+            )
             return True
 
         except httpx.RequestError as exc:
@@ -192,8 +205,26 @@ async def list_card(
 
             # ── success ────────────────────────────────────────────────────
             body = resp.json()
-            # EA returns the new trade ID as "idStr" (string) alongside numeric "id"
-            trade_id = str(body.get("idStr") or body.get("id", ""))
+            # EA returns the new trade ID as "idStr" (string) alongside numeric "id".
+            # A real listing always comes back with a positive trade id; a 200
+            # with no id means the auction was NOT created (e.g. the item never
+            # made it into the tradepile) — do not report that as success or the
+            # client is told a card was listed when it was not.
+            raw_id = body.get("idStr") or body.get("id")
+            trade_id = str(raw_id) if raw_id else ""
+
+            if not trade_id or trade_id == "0":
+                logger.error(
+                    "list_card: HTTP 200 but NO trade id for item_id=%d "
+                    "buy_now=%d starting_bid=%d — auction was not created. "
+                    "Raw response: %s",
+                    item_id,
+                    buy_now_price,
+                    starting_bid,
+                    resp.text,
+                )
+                return ListResult(success=False, error="no_trade_id")
+
             logger.info(
                 "list_card SUCCESS item_id=%d trade_id=%s listed_price=%d",
                 item_id,

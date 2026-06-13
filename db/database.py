@@ -333,7 +333,9 @@ async def create_order(telegram_id: int, order_amount: int) -> dict | None:
     """
     Create a pending order for *telegram_id* spending *order_amount* coins.
 
-    Derives quantity from the active card's buy_price and max_cards.
+    Derives quantity from the active card's list_price and max_cards:
+    each card is listed at list_price, so that is what one card costs
+    the client (e.g. order 7600 with list_price 3800 → 2 cards).
     Returns the new order as a dict, or None on failure.
     """
     async with aiosqlite.connect(DB_PATH) as db:
@@ -348,13 +350,13 @@ async def create_order(telegram_id: int, order_amount: int) -> dict | None:
             return None
 
         async with db.execute(
-            "SELECT id, buy_price_max, max_cards FROM cards WHERE is_active = 1 LIMIT 1"
+            "SELECT id, list_price, max_cards FROM cards WHERE is_active = 1 LIMIT 1"
         ) as cur:
             card = await cur.fetchone()
-        if not card or card["buy_price_max"] <= 0:
+        if not card or card["list_price"] <= 0:
             return None
 
-        quantity = min(order_amount // card["buy_price_max"], card["max_cards"])
+        quantity = min(order_amount // card["list_price"], card["max_cards"])
         if quantity < 1:
             return None
 
