@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 MAX_SEARCH_RETRIES = 5       # consecutive empty searches before aborting
 SEARCH_WAIT_S = 30           # seconds to wait between empty-search retries
 MAX_BUY_FAILS = 3            # consecutive buy errors before aborting
+MAX_LIST_FAILS = 3           # move/list retries for one held card before aborting
 CYCLE_DELAY_MIN = 2.0        # seconds — extra pause after each buy+list cycle
 CYCLE_DELAY_MAX = 5.0
 
@@ -147,14 +148,15 @@ class OrderWorker:
         )
 
         # ── Restart-safe counter ──────────────────────────────────────────────
-        # Count already-done transactions so a bot restart mid-order
-        # continues from where it left off rather than re-buying.
-        cards_bought = await count_transactions_for_order(order_id)
-        if cards_bought > 0:
+        # One transaction is written per *listed* card, so counting them lets a
+        # bot restart mid-order continue from where it left off rather than
+        # re-listing cards that are already on the market.
+        cards_listed = await count_transactions_for_order(order_id)
+        if cards_listed > 0:
             logger.info(
-                "Order #%d: resuming — %d/%d cards already bought",
+                "Order #%d: resuming — %d/%d cards already listed",
                 order_id,
-                cards_bought,
+                cards_listed,
                 quantity,
             )
 
@@ -163,25 +165,25 @@ class OrderWorker:
             await self._do_process(
                 order_id=order_id,
                 quantity=quantity,
-                cards_bought=cards_bought,
+                cards_listed=cards_listed,
                 card_config=order,
             )
         except _OrderAborted as exc:
             logger.error("Order #%d aborted: %s", order_id, exc.reason)
             await update_order_status(order_id, "failed")
             # _do_process tracks progress in a local copy — recount from the
-            # DB so the abort messages show the real number of bought cards.
-            cards_bought = await count_transactions_for_order(order_id)
+            # DB so the abort messages show the real number of listed cards.
+            cards_listed = await count_transactions_for_order(order_id)
             await self._notify_admins(
                 f"❌ <b>Order #{order_id} failed</b>\n"
                 f"Card: {card_name}\n"
                 f"Reason: {exc.reason}\n"
-                f"Cards bought before abort: {cards_bought}"
+                f"Cards listed before abort: {cards_listed}"
             )
             await safe_send(
                 self.bot,
                 client_telegram_id,
-                f"⚠️ سفارش شما متوقف شد — {cards_bought} از {quantity} کارت لیست شد.\n"
+                f"⚠️ سفارش شما متوقف شد — {cards_listed} از {quantity} کارت لیست شد.\n"
                 "لطفاً با ادمین تماس بگیرید.",
             )
             return
@@ -213,12 +215,17 @@ class OrderWorker:
         *,
         order_id: int,
         quantity: int,
-        cards_bought: int,
+        cards_listed: int,
         card_config: dict,
     ) -> None:
         """
         Inner buy/list loop.  Raises _OrderAborted on unrecoverable failure.
-        Mutates `cards_bought` via nonlocal (tracked inline).
+
+        Progress is counted in *listed* cards, not bought cards: a card is only
+        counted (and its transaction saved) once it is actually on the market.
+        A card that has been bought but not yet listed is "held" and the same
+        card is retried for move/list — never abandoned in favour of buying
+        another — so the order never silently delivers fewer cards than ordered.
         """
         card_name: str = card_config["card_name"]
         list_price: int = card_config["list_price"]
@@ -239,197 +246,234 @@ class OrderWorker:
 
         search_misses = 0          # consecutive empty searches
         consecutive_buy_fails = 0  # consecutive buy errors
+        consecutive_list_fails = 0  # consecutive move/list errors for `held`
 
-        while cards_bought < quantity:
+        # A card that has been bought but not yet listed.  It is retried for
+        # move/list on the next iteration rather than abandoned, so a transient
+        # listing failure never makes the order deliver fewer cards than ordered.
+        # dict(item_id, price_paid, player_name) | None
+        held: dict | None = None
 
-            # ── SEARCH ────────────────────────────────────────────────────────
-            listings = await search_card(self.session, card_config)
+        while cards_listed < quantity:
 
-            if self.session.expired:
-                if not await self._refresh_session():
-                    raise _OrderAborted("session expired during search — refresh failed")
-                continue
+            # ── ACQUIRE (search + buy) unless we already hold a card ──────────
+            if held is None:
+                # ── SEARCH ────────────────────────────────────────────────────
+                listings = await search_card(self.session, card_config)
 
-            if not listings:
-                search_misses += 1
-                logger.info(
-                    "Order #%d: no listings (miss %d/%d) — waiting %ds",
-                    order_id,
-                    search_misses,
-                    MAX_SEARCH_RETRIES,
-                    SEARCH_WAIT_S,
-                )
-                if search_misses >= MAX_SEARCH_RETRIES:
-                    raise _OrderAborted(
-                        f"no listings found after {MAX_SEARCH_RETRIES} retries"
+                if self.session.expired:
+                    if not await self._refresh_session():
+                        raise _OrderAborted("session expired during search — refresh failed")
+                    continue
+
+                if not listings:
+                    search_misses += 1
+                    logger.info(
+                        "Order #%d: no listings (miss %d/%d) — waiting %ds",
+                        order_id,
+                        search_misses,
+                        MAX_SEARCH_RETRIES,
+                        SEARCH_WAIT_S,
                     )
-                await asyncio.sleep(SEARCH_WAIT_S)
-                continue
+                    if search_misses >= MAX_SEARCH_RETRIES:
+                        raise _OrderAborted(
+                            f"no listings found after {MAX_SEARCH_RETRIES} retries"
+                        )
+                    await asyncio.sleep(SEARCH_WAIT_S)
+                    continue
 
-            search_misses = 0
-            cheapest = listings[0]
-            logger.debug(
-                "Order #%d: cheapest listing trade=%d price=%d",
-                order_id,
-                cheapest.trade_id,
-                cheapest.buy_now_price,
-            )
-
-            # ── BUY ───────────────────────────────────────────────────────────
-            result = await buy_card(self.session, cheapest)
-
-            if self.session.expired:
-                if not await self._refresh_session():
-                    raise _OrderAborted("session expired during buy — refresh failed")
-                continue
-
-            if result.error == "item_unavailable":
-                # Item was snatched between search and bid — harmless, retry
-                logger.info(
-                    "Order #%d: trade=%d snatched — searching again",
+                search_misses = 0
+                cheapest = listings[0]
+                logger.debug(
+                    "Order #%d: cheapest listing trade=%d price=%d",
                     order_id,
                     cheapest.trade_id,
+                    cheapest.buy_now_price,
                 )
-                continue
 
-            if not result.success:
-                consecutive_buy_fails += 1
-                logger.warning(
-                    "Order #%d: buy failed (%d/%d): %s",
-                    order_id,
-                    consecutive_buy_fails,
-                    MAX_BUY_FAILS,
-                    result.error,
-                )
-                if consecutive_buy_fails >= MAX_BUY_FAILS:
-                    raise _OrderAborted(
-                        f"buy failed {MAX_BUY_FAILS} consecutive times: {result.error}"
+                # ── BUY ───────────────────────────────────────────────────────
+                result = await buy_card(self.session, cheapest)
+
+                if self.session.expired:
+                    if not await self._refresh_session():
+                        raise _OrderAborted("session expired during buy — refresh failed")
+                    continue
+
+                if result.error == "item_unavailable":
+                    # Item was snatched between search and bid — harmless, retry
+                    logger.info(
+                        "Order #%d: trade=%d snatched — searching again",
+                        order_id,
+                        cheapest.trade_id,
                     )
-                await human_delay(CYCLE_DELAY_MIN, CYCLE_DELAY_MAX)
-                continue
+                    continue
 
-            # ── BUY SUCCESS ───────────────────────────────────────────────────
-            consecutive_buy_fails = 0
-            cards_bought += 1
-            logger.info(
-                "Order #%d: bought item=%d at %d  (%d/%d)",
-                order_id,
-                result.item_id,
-                result.price_paid,
-                cards_bought,
-                quantity,
-            )
+                if not result.success:
+                    consecutive_buy_fails += 1
+                    logger.warning(
+                        "Order #%d: buy failed (%d/%d): %s",
+                        order_id,
+                        consecutive_buy_fails,
+                        MAX_BUY_FAILS,
+                        result.error,
+                    )
+                    if consecutive_buy_fails >= MAX_BUY_FAILS:
+                        raise _OrderAborted(
+                            f"buy failed {MAX_BUY_FAILS} consecutive times: {result.error}"
+                        )
+                    await human_delay(CYCLE_DELAY_MIN, CYCLE_DELAY_MAX)
+                    continue
 
-            # Persist immediately — if we crash now the restart counter
-            # will skip this card.
-            # The market API itself carries no names; resolve via the EA
-            # players.json metadata, falling back to the configured card name.
-            player_name = (
-                cheapest.player_name
-                or await get_player_name(cheapest.resource_id)
-                or card_name
-            )
-            await save_transaction(
-                order_id=order_id,
-                card_name=card_name,
-                player_name=player_name,
-                bought_price=result.price_paid,
-                listed_price=list_price,
-                buynow_price=list_price,
-            )
+                # ── BUY SUCCESS ────────────────────────────────────────────────
+                consecutive_buy_fails = 0
+                consecutive_list_fails = 0
+                # The market API itself carries no names; resolve the real
+                # player name from the EA players.json metadata via resourceId,
+                # falling back to the configured card name only if unavailable.
+                player_name = (
+                    cheapest.player_name
+                    or await get_player_name(cheapest.resource_id)
+                    or card_name
+                )
+                held = {
+                    "item_id": result.item_id,
+                    "price_paid": result.price_paid,
+                    "player_name": player_name,
+                }
+                logger.info(
+                    "Order #%d: bought item=%d at %d  (listed %d/%d)",
+                    order_id,
+                    result.item_id,
+                    result.price_paid,
+                    cards_listed,
+                    quantity,
+                )
+
+            item_id = held["item_id"]
 
             # ── MOVE TO TRADEPILE ─────────────────────────────────────────────
-            moved = await move_to_tradepile(self.session, result.item_id)
+            moved = await move_to_tradepile(self.session, item_id)
             if self.session.expired:
                 if not await self._refresh_session():
                     raise _OrderAborted("session expired moving to tradepile — refresh failed")
-                moved = await move_to_tradepile(self.session, result.item_id)
+                moved = await move_to_tradepile(self.session, item_id)
 
             if not moved:
+                consecutive_list_fails += 1
                 logger.warning(
-                    "Order #%d: item=%d could not be moved to tradepile — skipping list",
+                    "Order #%d: item=%d could not be moved to tradepile "
+                    "(attempt %d/%d)",
                     order_id,
-                    result.item_id,
+                    item_id,
+                    consecutive_list_fails,
+                    MAX_LIST_FAILS,
                 )
-                await self._notify_admins(
-                    f"⚠️ <b>Tradepile move failed</b> — order #{order_id}\n"
-                    f"Item {result.item_id} was bought but could not be moved to tradepile."
-                )
+                if consecutive_list_fails >= MAX_LIST_FAILS:
+                    await self._notify_admins(
+                        f"⚠️ <b>Tradepile move failed</b> — order #{order_id}\n"
+                        f"Item {item_id} was bought at {held['price_paid']:,} but "
+                        f"could not be moved to tradepile after {MAX_LIST_FAILS} "
+                        f"attempts. Check inventory manually."
+                    )
+                    raise _OrderAborted(
+                        f"could not move bought item {item_id} to tradepile"
+                    )
                 await human_delay(CYCLE_DELAY_MIN, CYCLE_DELAY_MAX)
-                continue
+                continue  # keep `held` and retry the same card
 
             await asyncio.sleep(2)
 
             # ── LIST ──────────────────────────────────────────────────────────
             logger.info(
                 "About to list item=%d buy_now=%d start_bid=%d",
-                result.item_id, list_price, start_bid,
+                item_id, list_price, start_bid,
             )
             list_result = await list_card(
                 self.session,
-                result.item_id,
+                item_id,
                 list_price,
                 start_bid,
             )
 
             if self.session.expired:
-                # Attempt one more listing after re-login; if refresh fails,
-                # card is bought but unlisted — log and keep going.
-                if await self._refresh_session():
-                    list_result = await list_card(
-                        self.session,
-                        result.item_id,
-                        list_price,
-                        start_bid,
-                    )
-                else:
-                    logger.error(
-                        "Order #%d: item=%d bought but session refresh failed — "
-                        "card is unlisted in inventory",
-                        order_id,
-                        result.item_id,
-                    )
-
-            if list_result.success:
-                logger.info(
-                    "Order #%d: listed item=%d trade=%s at %d",
-                    order_id,
-                    result.item_id,
-                    list_result.trade_id,
+                if not await self._refresh_session():
+                    raise _OrderAborted("session expired during list — refresh failed")
+                list_result = await list_card(
+                    self.session,
+                    item_id,
                     list_price,
+                    start_bid,
                 )
-                # Tell the client right away — the final summary only goes
-                # out once the whole order is done, which can take a while.
-                try:
-                    await send_card_listed(
-                        bot=self.bot,
-                        client_telegram_id=card_config["client_telegram_id"],
-                        player_name=player_name,
-                        # lister floors the bid to a 100-coin tier; show the
-                        # same value the auction actually uses
-                        start_bid=(start_bid // 100) * 100,
-                        buy_now=list_price,
-                        cards_done=cards_bought,
-                        total=quantity,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Order #%d: could not send card-listed message to client",
-                        order_id,
-                        exc_info=True,
-                    )
-            else:
+
+            if not list_result.success:
+                consecutive_list_fails += 1
                 logger.warning(
-                    "Order #%d: item=%d bought but listing failed: %s",
+                    "Order #%d: item=%d bought but listing failed (attempt %d/%d): %s",
                     order_id,
-                    result.item_id,
+                    item_id,
+                    consecutive_list_fails,
+                    MAX_LIST_FAILS,
                     list_result.error,
                 )
-                await self._notify_admins(
-                    f"⚠️ <b>Listing failed</b> — order #{order_id}\n"
-                    f"Item {result.item_id} was bought at {result.price_paid:,} "
-                    f"but could not be listed. Check inventory manually."
+                if consecutive_list_fails >= MAX_LIST_FAILS:
+                    await self._notify_admins(
+                        f"⚠️ <b>Listing failed</b> — order #{order_id}\n"
+                        f"Item {item_id} was bought at {held['price_paid']:,} but "
+                        f"could not be listed after {MAX_LIST_FAILS} attempts. "
+                        f"Check inventory manually."
+                    )
+                    raise _OrderAborted(
+                        f"listing failed {MAX_LIST_FAILS}x for item {item_id}: "
+                        f"{list_result.error}"
+                    )
+                await human_delay(CYCLE_DELAY_MIN, CYCLE_DELAY_MAX)
+                continue  # keep `held` and retry listing the same card
+
+            # ── LIST SUCCESS ──────────────────────────────────────────────────
+            consecutive_list_fails = 0
+            # Persist only now — one transaction == one card actually on the
+            # market, so the restart counter and the completion summary both
+            # reflect listed cards, never bought-but-unlisted ones.
+            await save_transaction(
+                order_id=order_id,
+                card_name=card_name,
+                player_name=held["player_name"],
+                bought_price=held["price_paid"],
+                listed_price=list_price,
+                buynow_price=list_price,
+            )
+            cards_listed += 1
+            logger.info(
+                "Order #%d: listed item=%d trade=%s at %d  (%d/%d)",
+                order_id,
+                item_id,
+                list_result.trade_id,
+                list_price,
+                cards_listed,
+                quantity,
+            )
+            # Tell the client right away — the final summary only goes out once
+            # the whole order is done, which can take a while.
+            try:
+                await send_card_listed(
+                    bot=self.bot,
+                    client_telegram_id=card_config["client_telegram_id"],
+                    player_name=held["player_name"],
+                    # lister floors the bid to a 100-coin tier; show the
+                    # same value the auction actually uses
+                    start_bid=(start_bid // 100) * 100,
+                    buy_now=list_price,
+                    cards_done=cards_listed,
+                    total=quantity,
                 )
+            except Exception:
+                logger.warning(
+                    "Order #%d: could not send card-listed message to client",
+                    order_id,
+                    exc_info=True,
+                )
+
+            held = None  # card delivered — clear so the next loop buys a new one
 
             # ── INTER-CYCLE DELAY ─────────────────────────────────────────────
             await human_delay(CYCLE_DELAY_MIN, CYCLE_DELAY_MAX)
