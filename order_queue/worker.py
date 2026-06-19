@@ -248,6 +248,12 @@ class OrderWorker:
         consecutive_buy_fails = 0  # consecutive buy errors
         consecutive_list_fails = 0  # consecutive move/list errors for `held`
 
+        # EA's market index lags: a card we just bought keeps showing up in the
+        # next search, and re-bidding it returns HTTP 461.  Remember every trade
+        # we've already bought or that came back unavailable so we always move on
+        # to a different listing instead of looping on the stale one.
+        seen_trade_ids: set[int] = set()
+
         # A card that has been bought but not yet listed.  It is retried for
         # move/list on the next iteration rather than abandoned, so a transient
         # listing failure never makes the order deliver fewer cards than ordered.
@@ -266,26 +272,31 @@ class OrderWorker:
                         raise _OrderAborted("session expired during search — refresh failed")
                     continue
 
-                if not listings:
+                # Drop listings we've already bought / found unavailable so the
+                # cheapest *fresh* one is picked.
+                fresh = [l for l in listings if l.trade_id not in seen_trade_ids]
+
+                if not fresh:
                     search_misses += 1
                     logger.info(
-                        "Order #%d: no listings (miss %d/%d) — waiting %ds",
+                        "Order #%d: no fresh listings (miss %d/%d, %d stale) — waiting %ds",
                         order_id,
                         search_misses,
                         MAX_SEARCH_RETRIES,
+                        len(listings),
                         SEARCH_WAIT_S,
                     )
                     if search_misses >= MAX_SEARCH_RETRIES:
                         raise _OrderAborted(
-                            f"no listings found after {MAX_SEARCH_RETRIES} retries"
+                            f"no fresh listings found after {MAX_SEARCH_RETRIES} retries"
                         )
                     await asyncio.sleep(SEARCH_WAIT_S)
                     continue
 
                 search_misses = 0
-                cheapest = listings[0]
+                cheapest = fresh[0]
                 logger.debug(
-                    "Order #%d: cheapest listing trade=%d price=%d",
+                    "Order #%d: cheapest fresh listing trade=%d price=%d",
                     order_id,
                     cheapest.trade_id,
                     cheapest.buy_now_price,
@@ -300,9 +311,11 @@ class OrderWorker:
                     continue
 
                 if result.error == "item_unavailable":
-                    # Item was snatched between search and bid — harmless, retry
+                    # Snatched / stale / expired — never try this trade again,
+                    # search for the next one.
+                    seen_trade_ids.add(cheapest.trade_id)
                     logger.info(
-                        "Order #%d: trade=%d snatched — searching again",
+                        "Order #%d: trade=%d unavailable — skipping, searching again",
                         order_id,
                         cheapest.trade_id,
                     )
@@ -327,6 +340,9 @@ class OrderWorker:
                 # ── BUY SUCCESS ────────────────────────────────────────────────
                 consecutive_buy_fails = 0
                 consecutive_list_fails = 0
+                # Never bid on this trade again — EA keeps returning it in the
+                # next search until its index catches up.
+                seen_trade_ids.add(cheapest.trade_id)
                 # The market API itself carries no names; resolve the real
                 # player name from the EA players.json metadata via resourceId,
                 # falling back to the configured card name only if unavailable.

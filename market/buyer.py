@@ -242,11 +242,16 @@ async def buy_card(
                 )
                 return BuyResult(success=False, error="session_expired")
 
-            # ── 422: item already gone or bid too low ──────────────────────
-            if resp.status_code == 422:
+            # ── 422 / 461: trade no longer available or bid invalid ────────
+            # 461 is EA's "trade not available to bid on" — it comes back when
+            # the listing was already bought/expired or is a stale search
+            # result (EA's market index lags, so a card just bought keeps
+            # appearing in the next search).  Same handling as 422: skip it.
+            if resp.status_code in (422, 461):
                 logger.warning(
-                    "buy_card trade_id=%d: item no longer available (422)",
+                    "buy_card trade_id=%d: trade no longer available (HTTP %d)",
                     listing.trade_id,
+                    resp.status_code,
                 )
                 return BuyResult(success=False, error="item_unavailable")
 
@@ -260,7 +265,17 @@ async def buy_card(
                     error=f"http_{resp.status_code}_after_{MAX_RETRIES}_attempts",
                 )
 
-            resp.raise_for_status()
+            # ── any other non-success status ───────────────────────────────
+            # Return a failure instead of raising — an unhandled status here
+            # used to throw out of the worker and fail the whole order.
+            if resp.status_code >= 300:
+                logger.error(
+                    "buy_card trade_id=%d unexpected HTTP %d: %s",
+                    listing.trade_id,
+                    resp.status_code,
+                    resp.text[:300],
+                )
+                return BuyResult(success=False, error=f"http_{resp.status_code}")
 
             # ── success ────────────────────────────────────────────────────
             body = resp.json()
