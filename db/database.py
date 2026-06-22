@@ -90,6 +90,8 @@ _MIGRATIONS = [
     "UPDATE cards SET buy_price_max = buy_price WHERE buy_price_max = 0 AND buy_price > 0",
     # Player name per transaction
     "ALTER TABLE transactions ADD COLUMN player_name TEXT",
+    # Player position (e.g. CB, ST) resolved from players.json at list time
+    "ALTER TABLE transactions ADD COLUMN position TEXT",
 ]
 
 # ---------------------------------------------------------------------------
@@ -538,16 +540,17 @@ async def save_transaction(
     bought_price: int,
     listed_price: int,
     buynow_price: int,
+    position: str | None = None,
 ) -> None:
     """Persist one completed buy+list cycle to the transactions table."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
             INSERT INTO transactions
-                (order_id, card_name, player_name, bought_price, listed_price, buynow_price)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (order_id, card_name, player_name, bought_price, listed_price, buynow_price, position)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (order_id, card_name, player_name, bought_price, listed_price, buynow_price),
+            (order_id, card_name, player_name, bought_price, listed_price, buynow_price, position),
         )
         await db.commit()
 

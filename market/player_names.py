@@ -69,6 +69,7 @@ _HEADERS = {
 }
 
 _names: dict[int, str] | None = None
+_positions: dict[int, str] | None = None
 _load_failed = False  # only attempt the download once per process
 _lock = asyncio.Lock()
 
@@ -82,8 +83,8 @@ def _pick_name(player: dict) -> str:
     )
 
 
-def _build_name_map(body: dict, source: str) -> dict[int, str]:
-    """Turn a parsed players.json body into an id → name map."""
+def _build_maps(body: dict, source: str) -> tuple[dict[int, str], dict[int, str]]:
+    """Turn a parsed players.json body into (id→name, id→position) maps."""
     players: list[dict] = []
     for section in ("Players", "LegendsPlayers"):
         players.extend(body.get(section, []))
@@ -95,25 +96,29 @@ def _build_name_map(body: dict, source: str) -> dict[int, str]:
             source, json.dumps(players[0], ensure_ascii=False)[:500],
         )
     names: dict[int, str] = {}
+    positions: dict[int, str] = {}
     for player in players:
         pid = player.get("id")
         if pid is not None:
             names[int(pid)] = _pick_name(player)
-    return names
+            pos = player.get("p") or player.get("pos")
+            if pos:
+                positions[int(pid)] = str(pos)
+    return names, positions
 
 
-def _load_local() -> dict[int, str] | None:
+def _load_local() -> tuple[dict[int, str], dict[int, str]] | None:
     """Load names from a locally-saved players.json, if one exists."""
     if not os.path.isfile(_PLAYERS_FILE):
         return None
     try:
         with open(_PLAYERS_FILE, "r", encoding="utf-8") as fh:
             body = json.load(fh)
-        names = _build_name_map(body, _PLAYERS_FILE)
+        names, positions = _build_maps(body, _PLAYERS_FILE)
         if names:
             logger.info("players.json: loaded %d player names from local file %s",
                         len(names), _PLAYERS_FILE)
-            return names
+            return names, positions
         logger.warning("players.json: local file %s has no players", _PLAYERS_FILE)
     except Exception as exc:
         logger.warning("players.json: failed to read local file %s: %s",
@@ -121,7 +126,7 @@ def _load_local() -> dict[int, str] | None:
     return None
 
 
-async def _download() -> dict[int, str] | None:
+async def _download() -> tuple[dict[int, str], dict[int, str]] | None:
     for url in _PLAYERS_URLS:
         try:
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
@@ -142,10 +147,10 @@ async def _download() -> dict[int, str] | None:
                     url, resp.headers.get("content-type", "?"), len(resp.content),
                 )
                 continue
-            names = _build_name_map(body, url)
+            names, positions = _build_maps(body, url)
             if names:
                 logger.info("players.json: loaded %d player names from %s", len(names), url)
-                return names
+                return names, positions
             logger.warning("players.json: empty/unexpected payload from %s", url)
         except Exception as exc:
             logger.warning("players.json: failed to load from %s: %s", url, exc)
@@ -154,7 +159,7 @@ async def _download() -> dict[int, str] | None:
 
 async def get_player_name(resource_id: int) -> str | None:
     """Resolve the player name for *resource_id*, or None if unknown."""
-    global _names, _load_failed
+    global _names, _positions, _load_failed
 
     if not resource_id:
         return None
@@ -172,10 +177,25 @@ async def get_player_name(resource_id: int) -> str | None:
                         "fall back to the configured card name until restart"
                     )
                 else:
-                    _names = result
+                    _names, _positions = result
 
     if _names is None:
         return None
 
     base_id = resource_id % 0x1000000
     return _names.get(base_id)
+
+
+async def get_player_position(resource_id: int) -> str | None:
+    """Resolve the player position for *resource_id*, or None if unknown."""
+    if not resource_id:
+        return None
+
+    # Trigger map loading if not yet done (reuses the same JSON load as names).
+    await get_player_name(resource_id)
+
+    if _positions is None:
+        return None
+
+    base_id = resource_id % 0x1000000
+    return _positions.get(base_id)

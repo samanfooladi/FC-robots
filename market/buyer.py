@@ -82,6 +82,7 @@ def _parse_listings(raw: dict) -> list[CardListing]:
                 start_price=int(auction.get("startingBid", 0)),
                 player_name=player_name,
                 rating=int(item.get("rating", 0)),
+                position=item.get("preferredPosition", ""),
             )
         )
     return sorted(listings, key=lambda c: c.buy_now_price)

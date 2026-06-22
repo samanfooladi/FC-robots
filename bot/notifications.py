@@ -24,6 +24,10 @@ def _fmt_ts(unix: float) -> str:
     return datetime.utcfromtimestamp(unix).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _fmt_ts_sec(unix: float) -> str:
+    return datetime.utcfromtimestamp(unix).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 async def safe_send(bot: Bot, chat_id: int, text: str) -> bool:
     """
     Send a message; log and skip if the user has blocked the bot.
@@ -79,6 +83,7 @@ async def send_order_complete(
     bot: Bot,
     client_telegram_id: int,
     order_id: int,
+    order_amount: int,
     transactions: list[dict],
 ) -> None:
     """
@@ -92,6 +97,7 @@ async def send_order_complete(
     """
     import time as _time
     from html import escape
+    from collections import OrderedDict
 
     logger.info("Sending completion message to %s", client_telegram_id)
 
@@ -103,21 +109,41 @@ async def send_order_complete(
         )
         return
 
-    blocks: list[str] = []
+    # Group same-player transactions together (preserving first-seen order).
+    groups: OrderedDict[str, list[dict]] = OrderedDict()
     for t in transactions:
-        name = escape(t.get("player_name") or t.get("card_name", "—"))
-        bought = t["bought_price"]
-        buy_now = t["listed_price"]
-        # EA bid increment for 1000-10000 range is 100 coins
+        key = t.get("player_name") or t.get("card_name") or "—"
+        groups.setdefault(key, []).append(t)
+
+    blocks: list[str] = []
+    for player_name, txs in groups.items():
+        count = len(txs)
+        total_bought = sum(t["bought_price"] for t in txs)
+        buy_now = txs[0]["listed_price"]
         start_bid = (int(buy_now * 0.95) // 100) * 100
-        blocks.append(
-            f"👤 {name}\n"
-            f"📦 تعداد: 1\n"
-            f"💰 خریداری شده: {bought:,}\n"
-            f"🏷 Start Bid: {start_bid:,}\n"
-            f"💵 Buy Now: {buy_now:,}\n"
-            "─────────────────"
+        card_version = txs[0].get("card_name", "—")
+        position = next((t.get("position") for t in txs if t.get("position")), None)
+        first_ts = min(t["listed_at"] for t in txs)
+        last_ts = max(t["listed_at"] for t in txs)
+
+        block = (
+            f"🔢 Count: {count}\n"
+            f"\n"
+            f"💰 Initial Seller Coins: {order_amount:,}$\n"
+            f"⚽️ Player: {escape(player_name)}\n"
+            f"🏆 Version: {escape(card_version)}\n"
+            f"🎯 Start Price: {start_bid:,}\n"
+            f"🛒 Buynow Price: {buy_now:,}\n"
+            f"\n"
+            f"✅ Bought Price: {total_bought:,}\n"
         )
+        if position:
+            block += f"\n📍 Position: {escape(position)}\n"
+        block += (
+            f"⏳ ListedAt_from: {_fmt_ts_sec(first_ts)}\n"
+            f"⌛️ ListedAt_to: {_fmt_ts_sec(last_ts)}"
+        )
+        blocks.append(block + "\n─────────────────")
 
     ts = _fmt_ts(transactions[-1]["listed_at"] if transactions else _time.time())
     blocks.append(f"📊 جمع کل: {len(transactions)} کارت\n⏰ {ts}")

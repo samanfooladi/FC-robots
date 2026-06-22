@@ -36,19 +36,28 @@ from db.database import (
 )
 from market.buyer import buy_card, search_card
 from market.lister import list_card, move_to_tradepile
-from market.player_names import get_player_name
+from market.player_names import get_player_name, get_player_position
 from bot.notifications import send_card_listed, send_order_complete, safe_send
 from utils.delays import human_delay
 
 logger = logging.getLogger(__name__)
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
-MAX_SEARCH_RETRIES = 5       # consecutive empty searches before aborting
 SEARCH_WAIT_S = 30           # seconds to wait between empty-search retries
 MAX_BUY_FAILS = 3            # consecutive buy errors before aborting
 MAX_LIST_FAILS = 3           # move/list retries for one held card before aborting
 CYCLE_DELAY_MIN = 2.0        # seconds — extra pause after each buy+list cycle
 CYCLE_DELAY_MAX = 5.0
+
+# ── Buy-price escalation ────────────────────────────────────────────────────
+# Strategy: buy as many of the *same* card as possible, switching to another
+# card in the rating band only when the current one runs out.  When nothing is
+# found in range after SWITCHES_BEFORE_BUMP consecutive searches, raise the max
+# buy price by PRICE_BUMP (keeping the min fixed) until it reaches MAX_BUY_PRICE,
+# after which the order aborts rather than overpaying.
+SWITCHES_BEFORE_BUMP = 3     # consecutive empty searches before raising the price
+PRICE_BUMP = 50              # coins to raise the max buy price by each time
+MAX_BUY_PRICE = 950          # hard ceiling on the per-card buy price
 
 
 class _OrderAborted(Exception):
@@ -202,6 +211,7 @@ class OrderWorker:
                 bot=self.bot,
                 client_telegram_id=client_telegram_id,
                 order_id=order_id,
+                order_amount=order["order_amount"],
                 transactions=transactions,
             )
         except Exception:
@@ -244,9 +254,26 @@ class OrderWorker:
                 f"list_price={list_price} is invalid — re-run /setcard to fix the card config"
             )
 
-        search_misses = 0          # consecutive empty searches
         consecutive_buy_fails = 0  # consecutive buy errors
         consecutive_list_fails = 0  # consecutive move/list errors for `held`
+
+        # ── Buy-price escalation state ────────────────────────────────────────
+        # Start at the configured max but never above the hard ceiling.  When
+        # nothing is found in range, the max is raised by PRICE_BUMP (min stays
+        # fixed) up to MAX_BUY_PRICE.
+        current_max = min(
+            card_config.get("buy_price_max", 0) or MAX_BUY_PRICE, MAX_BUY_PRICE
+        )
+        no_find_count = 0          # consecutive searches with nothing in range
+
+        # ── "Buy the same card as much as possible" ───────────────────────────
+        # Once a card is bought we lock onto its resourceId (the exact player +
+        # version) and keep buying that same card until none are left in range,
+        # then switch to whichever 80-81 card the market offers next.  A
+        # resource_id configured on the order pins it to one player — no switch.
+        fixed_player = bool(card_config.get("resource_id"))
+        locked_resource_id: int | None = card_config.get("resource_id") or None
+        locked_player_name: str = card_name
 
         # EA's market index lags: a card we just bought keeps showing up in the
         # next search, and re-bidding it returns HTTP 461.  Remember every trade
@@ -265,36 +292,85 @@ class OrderWorker:
             # ── ACQUIRE (search + buy) unless we already hold a card ──────────
             if held is None:
                 # ── SEARCH ────────────────────────────────────────────────────
-                listings = await search_card(self.session, card_config)
+                # Locked onto a player → search just that player so we see *all*
+                # their listings in range (an open band search only returns the
+                # global cheapest few, which can hide them).  Otherwise do an
+                # open band search to discover whichever card is cheapest now.
+                search_cfg = dict(card_config)
+                search_cfg["buy_price_max"] = current_max
+                if locked_resource_id:
+                    search_cfg["resource_id"] = locked_resource_id
+                else:
+                    search_cfg.pop("resource_id", None)
+
+                listings = await search_card(self.session, search_cfg)
 
                 if self.session.expired:
                     if not await self._refresh_session():
                         raise _OrderAborted("session expired during search — refresh failed")
                     continue
 
-                # Drop listings we've already bought / found unavailable so the
-                # cheapest *fresh* one is picked.
+                # Drop listings we've already bought / found unavailable, and —
+                # when locked — keep only the targeted player, so the cheapest
+                # *fresh* copy of the right card is picked.
                 fresh = [l for l in listings if l.trade_id not in seen_trade_ids]
+                if locked_resource_id:
+                    fresh = [l for l in fresh if l.resource_id == locked_resource_id]
 
                 if not fresh:
-                    search_misses += 1
+                    # Locked onto a player who is now sold out → switch to the
+                    # next card in the band (unless the order is pinned to one
+                    # player, in which case this counts as a price miss instead).
+                    if locked_resource_id and not fixed_player:
+                        logger.info(
+                            "Order #%d: no more '%s' in range ≤%d — switching to another card",
+                            order_id, locked_player_name, current_max,
+                        )
+                        locked_resource_id = None
+                        continue
+
+                    # Nothing buyable in range at all.  After SWITCHES_BEFORE_BUMP
+                    # consecutive misses, raise the max price by PRICE_BUMP until
+                    # the ceiling, then abort rather than overpay.
+                    no_find_count += 1
                     logger.info(
-                        "Order #%d: no fresh listings (miss %d/%d, %d stale) — waiting %ds",
+                        "Order #%d: nothing in range [%d-%d] (miss %d/%d, %d stale)",
                         order_id,
-                        search_misses,
-                        MAX_SEARCH_RETRIES,
+                        card_config["buy_price_min"],
+                        current_max,
+                        no_find_count,
+                        SWITCHES_BEFORE_BUMP,
                         len(listings),
-                        SEARCH_WAIT_S,
                     )
-                    if search_misses >= MAX_SEARCH_RETRIES:
+                    if no_find_count >= SWITCHES_BEFORE_BUMP:
+                        if current_max < MAX_BUY_PRICE:
+                            new_max = min(current_max + PRICE_BUMP, MAX_BUY_PRICE)
+                            logger.info(
+                                "Order #%d: raising max buy price %d → %d after %d misses",
+                                order_id, current_max, new_max, no_find_count,
+                            )
+                            current_max = new_max
+                            no_find_count = 0
+                            if not fixed_player:
+                                locked_resource_id = None
+                            continue  # search again immediately at the higher price
                         raise _OrderAborted(
-                            f"no fresh listings found after {MAX_SEARCH_RETRIES} retries"
+                            f"no listings found in range up to the max buy price "
+                            f"({MAX_BUY_PRICE}) after price escalation"
                         )
                     await asyncio.sleep(SEARCH_WAIT_S)
                     continue
 
-                search_misses = 0
+                no_find_count = 0
                 cheapest = fresh[0]
+                if not locked_resource_id:
+                    # First copy of a new card — lock onto it so subsequent
+                    # iterations keep buying the same player.
+                    locked_resource_id = cheapest.resource_id
+                    logger.info(
+                        "Order #%d: locked onto card resource=%d price=%d",
+                        order_id, locked_resource_id, cheapest.buy_now_price,
+                    )
                 logger.debug(
                     "Order #%d: cheapest fresh listing trade=%d price=%d",
                     order_id,
@@ -351,10 +427,14 @@ class OrderWorker:
                     or await get_player_name(cheapest.resource_id)
                     or card_name
                 )
+                locked_player_name = player_name
                 held = {
                     "item_id": result.item_id,
                     "price_paid": result.price_paid,
                     "player_name": player_name,
+                    # Prefer position from the live API response; fall back to
+                    # players.json lookup in case the API omits it.
+                    "position": cheapest.position or await get_player_position(cheapest.resource_id),
                 }
                 logger.info(
                     "Order #%d: bought item=%d at %d  (listed %d/%d)",
@@ -457,6 +537,7 @@ class OrderWorker:
                 bought_price=held["price_paid"],
                 listed_price=list_price,
                 buynow_price=list_price,
+                position=held.get("position"),
             )
             cards_listed += 1
             logger.info(

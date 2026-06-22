@@ -11,6 +11,7 @@ class CardListing:
     start_price: int   # current / starting bid
     player_name: str = ""  # commonName / lastName from itemData, empty if absent
     rating: int = 0    # itemData.rating — player overall, 0 if absent
+    position: str = ""  # itemData.preferredPosition e.g. "CAM", "CB", "ST"
 
 
 @dataclass
