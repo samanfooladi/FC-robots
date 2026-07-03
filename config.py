@@ -25,6 +25,12 @@ MAX_CLIENTS_PER_ACCOUNT: int = int(os.getenv("MAX_CLIENTS_PER_ACCOUNT", "5"))
 REQUEST_DELAY_MIN: float = float(os.getenv("REQUEST_DELAY_MIN", "0.5"))
 REQUEST_DELAY_MAX: float = float(os.getenv("REQUEST_DELAY_MAX", "2.0"))
 
+# Browser pool / persistent Chrome profiles
+PROFILES_DIR = Path(os.getenv("PROFILES_DIR", "data/profiles"))
+PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+BROWSER_HEADLESS: bool = os.getenv("BROWSER_HEADLESS", "false").strip().lower() in ("1", "true", "yes")
+BROWSER_HEALTH_CHECK_INTERVAL_S: int = int(os.getenv("BROWSER_HEALTH_CHECK_INTERVAL_S", "300"))
+
 
 def load_ea_accounts() -> list[dict]:
     """Read EA_ACCOUNT_N_* triplets from env, return sorted list."""
@@ -40,6 +46,7 @@ def load_ea_accounts() -> list[dict]:
                 "email": email,
                 "password": os.getenv(f"EA_ACCOUNT_{i}_PASSWORD", ""),
                 "otp_key": os.getenv(f"EA_ACCOUNT_{i}_OTP_KEY", ""),
+                "backup_code": os.getenv(f"EA_ACCOUNT_{i}_BACKUP_CODE", ""),
             }
         )
         i += 1

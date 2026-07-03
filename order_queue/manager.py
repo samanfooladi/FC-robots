@@ -3,20 +3,23 @@ QueueManager — lifecycle manager for all per-account OrderWorkers.
 
 Responsibilities
 ────────────────
-1. On startup: spawn one OrderWorker task per active EA account.
+1. On startup: spawn one OrderWorker task per active EA account that the
+   BrowserPool has successfully authenticated.
 2. On startup: re-queue any orders that were pending/in_progress when the
    bot last shut down (crash-safe restart).
 3. On new order: route it to the correct worker queue.
 4. Expose queue depth per account for monitoring.
+
+The BrowserPool (browser_pool.pool.BrowserPool) must already be started
+before QueueManager.start() is called — workers pull sessions from it and
+never authenticate themselves.
 """
 
 import asyncio
 import logging
 from aiogram import Bot
 
-from auth.login import login_to_fc
-from auth.session import load_session
-from config import EA_ACCOUNTS
+from browser_pool.pool import BrowserPool
 from db.database import (
     get_all_accounts,
     get_all_pending_orders,
@@ -28,8 +31,9 @@ logger = logging.getLogger(__name__)
 
 
 class QueueManager:
-    def __init__(self, bot: Bot) -> None:
+    def __init__(self, bot: Bot, browser_pool: BrowserPool) -> None:
         self.bot = bot
+        self.browser_pool = browser_pool
         self.workers: dict[int, OrderWorker] = {}
         self._tasks: list[asyncio.Task] = []
 
@@ -39,55 +43,30 @@ class QueueManager:
 
     async def start(self) -> None:
         """
-        Called once from main.py after init_db().
+        Called once from main.py after the BrowserPool has been started.
         Spawns workers and re-queues any surviving pending orders.
         """
         logger.info("QueueManager starting…")
-
-        # Build credential lookup by email (from .env config)
-        creds_by_email: dict[str, dict] = {a["email"]: a for a in EA_ACCOUNTS}
 
         for account in await get_all_accounts():
             account_id: int = account["id"]
             email: str = account["email"]
 
-            creds = creds_by_email.get(email)
-            if creds is None:
-                logger.warning(
-                    "Account %d (%s) is in DB but has no matching entry in .env — skipping",
+            session = await self.browser_pool.get_session(account_id)
+            if session is None:
+                logger.error(
+                    "Account %d (%s): BrowserPool has no session — worker will not be started",
                     account_id,
                     email,
                 )
                 continue
 
-            session = await load_session(account_id)
-            if session is None:
-                logger.info(
-                    "Account %d (%s): no valid session — attempting login…",
-                    account_id,
-                    email,
-                )
-                session = await login_to_fc(
-                    account_id=account_id,
-                    email=email,
-                    password=creds["password"],
-                    otp_key=creds["otp_key"],
-                )
-                if session is None:
-                    logger.error(
-                        "Account %d (%s): login failed — worker will not be started",
-                        account_id,
-                        email,
-                    )
-                    continue
-
             worker = OrderWorker(
                 account_id=account_id,
                 email=email,
-                password=creds["password"],
-                otp_key=creds["otp_key"],
                 session=session,
                 bot=self.bot,
+                browser_pool=self.browser_pool,
             )
             self.workers[account_id] = worker
             task = asyncio.create_task(

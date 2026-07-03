@@ -18,7 +18,12 @@ CREATE TABLE IF NOT EXISTS ea_accounts (
     session_token       TEXT,
     session_data        TEXT,
     session_created_at  REAL,
-    status              TEXT    NOT NULL DEFAULT 'active'
+    status              TEXT    NOT NULL DEFAULT 'active',
+    password            TEXT,
+    backup_code         TEXT,
+    profile_path        TEXT,
+    auth_method         TEXT    NOT NULL DEFAULT 'totp',
+    first_login_done    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS clients (
@@ -92,6 +97,12 @@ _MIGRATIONS = [
     "ALTER TABLE transactions ADD COLUMN player_name TEXT",
     # Player position (e.g. CB, ST) resolved from players.json at list time
     "ALTER TABLE transactions ADD COLUMN position TEXT",
+    # Browser pool / persistent-profile login (phase 2 foundation)
+    "ALTER TABLE ea_accounts ADD COLUMN password TEXT",
+    "ALTER TABLE ea_accounts ADD COLUMN backup_code TEXT",
+    "ALTER TABLE ea_accounts ADD COLUMN profile_path TEXT",
+    "ALTER TABLE ea_accounts ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'totp'",
+    "ALTER TABLE ea_accounts ADD COLUMN first_login_done INTEGER NOT NULL DEFAULT 0",
 ]
 
 # ---------------------------------------------------------------------------
@@ -116,13 +127,19 @@ async def init_db() -> None:
 async def _sync_accounts() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         for acct in EA_ACCOUNTS:
+            backup_code = acct.get("backup_code") or None
+            auth_method = "backup_code" if (backup_code and not acct["otp_key"]) else "totp"
             await db.execute(
                 """
-                INSERT INTO ea_accounts (email, otp_key)
-                VALUES (?, ?)
-                ON CONFLICT(email) DO UPDATE SET otp_key = excluded.otp_key
+                INSERT INTO ea_accounts (email, otp_key, password, backup_code, auth_method)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(email) DO UPDATE SET
+                    otp_key     = excluded.otp_key,
+                    password    = excluded.password,
+                    backup_code = excluded.backup_code,
+                    auth_method = excluded.auth_method
                 """,
-                (acct["email"], acct["otp_key"]),
+                (acct["email"], acct["otp_key"], acct["password"], backup_code, auth_method),
             )
         await db.commit()
     logger.info("Synced %d EA account(s) to database", len(EA_ACCOUNTS))
@@ -456,14 +473,47 @@ async def get_accounting_report() -> list[dict]:
 
 
 async def get_all_accounts() -> list[dict]:
-    """Return all active EA accounts (id + email) for manager startup."""
+    """Return all active EA accounts (credentials + profile state) for manager/pool startup."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, email FROM ea_accounts WHERE status = 'active' ORDER BY id"
+            """
+            SELECT id, email, otp_key, password, backup_code,
+                   profile_path, auth_method, first_login_done
+              FROM ea_accounts
+             WHERE status = 'active'
+             ORDER BY id
+            """
         ) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def mark_first_login_done(account_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE ea_accounts SET first_login_done = 1 WHERE id = ?",
+            (account_id,),
+        )
+        await db.commit()
+
+
+async def set_profile_path(account_id: int, profile_path: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE ea_accounts SET profile_path = ? WHERE id = ?",
+            (profile_path, account_id),
+        )
+        await db.commit()
+
+
+async def set_account_status(account_id: int, status: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE ea_accounts SET status = ? WHERE id = ?",
+            (status, account_id),
+        )
+        await db.commit()
 
 
 async def get_all_pending_orders() -> list[dict]:

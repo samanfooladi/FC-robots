@@ -13,8 +13,9 @@ State machine per order
 Session refresh
 ───────────────
 Any 401 from the EA API sets session.expired = True.  The worker detects
-this flag after every HTTP call and re-runs the full Playwright login before
-retrying the current operation.
+this flag after every HTTP call and asks the BrowserPool to re-authenticate
+this account (password-only, via its persistent browser profile) before
+retrying the current operation.  The worker never launches a browser itself.
 """
 
 import asyncio
@@ -24,7 +25,6 @@ from asyncio import Queue
 
 from aiogram import Bot
 
-from auth.login import login_to_fc
 from auth.session import SessionData
 from config import ADMIN_IDS
 from db.database import (
@@ -38,6 +38,7 @@ from market.buyer import buy_card, search_card
 from market.lister import list_card, move_to_tradepile
 from market.player_names import get_player_name, get_player_position
 from bot.notifications import send_card_listed, send_order_complete, safe_send
+from browser_pool.pool import BrowserPool
 from utils.delays import human_delay
 
 logger = logging.getLogger(__name__)
@@ -73,17 +74,15 @@ class OrderWorker:
         *,
         account_id: int,
         email: str,
-        password: str,
-        otp_key: str,
         session: SessionData | None,
         bot: Bot,
+        browser_pool: BrowserPool,
     ) -> None:
         self.account_id = account_id
         self.email = email
-        self.password = password
-        self.otp_key = otp_key
         self.session = session
         self.bot = bot
+        self.browser_pool = browser_pool
         self.queue: Queue[int] = Queue()  # holds order_id integers
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -121,7 +120,8 @@ class OrderWorker:
     async def _process_order(self, order_id: int) -> None:
         # ── Ensure session ────────────────────────────────────────────────────
         if self.session is None or not self.session.is_valid():
-            if not await self._refresh_session():
+            self.session = await self.browser_pool.get_session(self.account_id)
+            if self.session is None:
                 logger.error(
                     "Order #%d: no valid session and re-login failed — aborting",
                     order_id,
@@ -581,11 +581,12 @@ class OrderWorker:
 
     async def _refresh_session(self) -> bool:
         """
-        Re-run the full Playwright login for this account.
-        Updates self.session on success.  Returns True on success.
+        Ask the BrowserPool to re-authenticate this account (password-only,
+        via its persistent browser profile).  Updates self.session on
+        success.  Returns True on success.
         """
         logger.info(
-            "Account %d: session expired — re-logging in (%s)…",
+            "Account %d: session expired — requesting re-login from BrowserPool (%s)…",
             self.account_id,
             self.email,
         )
@@ -593,12 +594,7 @@ class OrderWorker:
         if self.session is not None:
             self.session.expired = False
 
-        new_session = await login_to_fc(
-            account_id=self.account_id,
-            email=self.email,
-            password=self.password,
-            otp_key=self.otp_key,
-        )
+        new_session = await self.browser_pool.force_relogin(self.account_id)
 
         if new_session:
             self.session = new_session

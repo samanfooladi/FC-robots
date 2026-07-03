@@ -2,11 +2,13 @@
 FC Bot — entry point.
 
 Phases implemented:
-  Phase 1 — Auth         (Playwright login + OTP + session storage)
-  Phase 2 — Market       (search, buy, list, tradepile via httpx)
-  Phase 3 — Telegram Bot (aiogram 3, admin + client flows)
-  Phase 4 — Queue System (per-account sequential OrderWorker)
-  Phase 5 — Scheduler    (APScheduler 9-hour accounting job)
+  Phase 1 — Auth          (Playwright login + OTP + session storage)
+  Phase 2 — Market        (search, buy, list, tradepile via httpx)
+  Phase 3 — Telegram Bot  (aiogram 3, admin + client flows)
+  Phase 4 — Queue System  (per-account sequential OrderWorker)
+  Phase 5 — Scheduler     (APScheduler 9-hour accounting job)
+  Phase 6 — Browser Pool  (persistent Chrome profiles, backup-code first
+                           login, silent session restoration)
 
 Run with:  python main.py
 """
@@ -21,6 +23,7 @@ from utils.logger import setup_logging
 from db.database import init_db
 from bot import create_dispatcher
 from bot import bot  # shared Bot instance
+from browser_pool.pool import BrowserPool
 from order_queue.manager import QueueManager
 from scheduler.runner import create_scheduler
 
@@ -53,19 +56,28 @@ async def main() -> None:
     # 1. DB — create tables + run additive migrations + seed accounts
     await init_db()
 
-    # 2. Queue manager — spawn per-account workers, re-queue surviving orders
-    queue_manager = QueueManager(bot)
+    # 2. Browser pool — launch/restore one persistent Chrome profile per
+    #    EA account before any worker exists; workers only ever consume
+    #    sessions from this pool, never authenticate themselves.
+    browser_pool = BrowserPool(bot)
+    await browser_pool.start()
+    health_check_task = asyncio.create_task(
+        browser_pool.health_check_loop(), name="browser-pool-health-check"
+    )
+
+    # 3. Queue manager — spawn per-account workers, re-queue surviving orders
+    queue_manager = QueueManager(bot, browser_pool)
     await queue_manager.start()
 
-    # 3. Accounting scheduler — 9-hour APScheduler job
+    # 4. Accounting scheduler — 9-hour APScheduler job
     scheduler = create_scheduler(bot)
     scheduler.start()
     logger.info("Accounting scheduler started (every 9 hours)")
 
-    # 4. Register bot command menu
+    # 5. Register bot command menu
     await _set_bot_commands(bot)
 
-    # 5. Start Telegram polling
+    # 6. Start Telegram polling
     dp = create_dispatcher()
     logger.info("Bot polling started — press Ctrl+C to stop")
     try:
@@ -78,6 +90,8 @@ async def main() -> None:
         scheduler.shutdown(wait=False)
         logger.info("Scheduler stopped")
         await queue_manager.stop()
+        health_check_task.cancel()
+        await browser_pool.stop()
         await bot.session.close()
         logger.info("Bot stopped.")
 

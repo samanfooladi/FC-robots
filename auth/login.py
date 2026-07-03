@@ -1,20 +1,26 @@
 """
-Playwright-based login flow for the FC Companion Web App.
+Playwright login flow for the FC Companion Web App.
 
-Flow
-----
-1.  Navigate to FC Web App URL  →  redirects to EA login
-2.  Fill email → click Next
-3.  Fill password → click Sign In
-4.  Detect 2-FA prompt  →  inject TOTP code
-5.  Wait for Web App shell to load  (networkidle + UT accountinfo XHR)
-6.  Intercept the first UT API request to capture X-UT-SID and
-    X-UT-PHISHING-TOKEN from outgoing headers + nucleusId from the response
-7.  Dump full cookie jar
-8.  Persist SessionData to DB and return it
+Two entry points, both operating on a page that belongs to a *persistent*
+browser context owned by browser_pool.BrowserPool — this module never
+launches or closes a browser itself.
+
+first_login()
+    Full credential flow: email -> password -> 2FA (TOTP or backup code) ->
+    capture session. Used once per account, the first time its persistent
+    profile is created. Ticks "remember this device" so subsequent restores
+    skip 2FA.
+
+restore_session()
+    Navigates the already-authenticated persistent page to the web app and
+    captures a fresh session without re-entering any credentials. Returns
+    None if the profile's session has actually died (login form appears),
+    in which case the caller should fall back to a password-only re-login.
 
 NOTE: EA occasionally changes login-page selectors; update the constants at
-the top of this file if the flow breaks.
+the top of this file if the flow breaks. The backup-code selectors in
+particular are best-effort placeholders that have not been verified against
+a live "use a backup code instead" screen yet.
 """
 
 import asyncio
@@ -23,16 +29,14 @@ import time
 from typing import Any
 
 from playwright.async_api import (
-    async_playwright,
     Page,
-    BrowserContext,
     Request,
     Response,
     TimeoutError as PWTimeout,
 )
 
 from .otp import generate_otp, remaining_seconds
-from .session import SessionData, save_session
+from .session import SessionData
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +51,6 @@ SEL_EMAIL = "#email"
 SEL_BTN_NEXT = "#logInBtn"
 SEL_PASSWORD = "#password"
 SEL_BTN_SIGNIN = "#logInBtn"
-# 2-FA / OTP — always required (fresh incognito context every run)
 SEL_OTP_INPUTS = ["input[placeholder*='6 digit']", "#codeEntry", "input[name='codeEntry']"]
 SEL_BTN_OTP_SUBMIT = ["#logInBtn"]
 # "Verify your identity" intermediate page
@@ -57,6 +60,19 @@ SEL_AUTHENTICATOR = (
     "div[class*='radio']:has-text('Authenticator')"
 )
 SEL_BTN_SEND_CODE = "#btnSendCode"
+
+# Backup-code 2FA — UNVERIFIED, best-effort selectors
+SEL_USE_ANOTHER_WAY = (
+    "a:has-text('another way'), a:has-text('Use a different way'), "
+    "button:has-text('another way'), a:has-text('backup code'), "
+    "div[class*='radio']:has-text('backup code')"
+)
+SEL_BACKUP_CODE_INPUTS = [
+    "input[name='backupCode']",
+    "#backupCode",
+    "input[placeholder*='backup' i]",
+    "input[placeholder*='code' i]",
+]
 
 # UT API fingerprint — we listen for this URL to grab session headers
 UT_ACCOUNTINFO_PATTERN = "utas"  # broad match; narrowed further in the handler
@@ -70,29 +86,110 @@ OTP_MIN_REMAINING = 5  # seconds
 # ---------------------------------------------------------------------------
 
 
+def _register_session_listeners(page: Page) -> dict[str, Any]:
+    """
+    Attach request/response listeners that capture UT session headers as
+    they fly by. Must be called BEFORE navigation so early accountinfo XHRs
+    fired during web-app load are not missed.
+    """
+    captured: dict[str, Any] = {}
+
+    def _on_request(req: Request) -> None:
+        if "utas" in req.url and req.headers.get("x-ut-sid"):
+            logger.info("UT request intercepted: %s", req.url)
+            captured.setdefault("sid", req.headers.get("x-ut-sid", ""))
+            captured.setdefault(
+                "phishing_token",
+                req.headers.get("x-ut-phishing-token", ""),
+            )
+
+    async def _on_response(resp: Response) -> None:
+        if "utas" not in resp.url:
+            return
+
+        token = resp.headers.get("x-ut-phishing-token", "")
+        if token:
+            captured.setdefault("phishing_token", token)
+            logger.info("Captured phishing_token from response headers: %s", resp.url)
+
+        if "accountinfo" in resp.url:
+            try:
+                body = await resp.json()
+                body_token = body.get("phishingToken", "") or body.get("phishing_token", "")
+                if body_token:
+                    captured.setdefault("phishing_token", body_token)
+                    logger.info("Captured phishing_token from response body")
+
+                personas = body.get("userAccountInfo", {}).get("personas", [{}])
+                captured.setdefault(
+                    "nucleus_id",
+                    str(personas[0].get("nucleusId", "")) if personas else "",
+                )
+                logger.debug("Captured nucleusId from accountinfo response")
+            except Exception as exc:
+                logger.debug("Could not parse accountinfo response: %s", exc)
+
+    page.on("request", _on_request)
+    page.on("response", _on_response)
+    return captured
+
+
+async def _goto_webapp(page: Page) -> None:
+    logger.debug("Navigating to FC Web App…")
+    await page.goto(FC_WEBAPP_URL, timeout=30_000)
+
+    # Some regions show a "Log In" button before the EA login page
+    try:
+        await page.wait_for_selector(
+            "a[href*='login'], button:has-text('Login'), .btn-login",
+            timeout=15_000,
+        )
+        await page.click("a[href*='login'], button:has-text('Login'), .btn-login")
+    except PWTimeout:
+        pass  # already on login form / already authenticated
+
+
 async def _fill_credentials(page: Page, email: str, password: str) -> None:
     logger.debug("Filling email…")
-    await page.wait_for_selector("#email", timeout=20_000)
-    await page.fill("#email", email)
+    await page.wait_for_selector(SEL_EMAIL, timeout=20_000)
+    await page.fill(SEL_EMAIL, email)
     await asyncio.sleep(0.5)
-    await page.click("#logInBtn")
+    await page.click(SEL_BTN_NEXT)
 
     logger.debug("Filling password…")
-    await page.wait_for_selector("#password", timeout=20_000)
-    await page.fill("#password", password)
+    await page.wait_for_selector(SEL_PASSWORD, timeout=20_000)
+    await page.fill(SEL_PASSWORD, password)
     await asyncio.sleep(0.5)
-    await page.click("#logInBtn")
+    await page.click(SEL_BTN_SIGNIN)
 
 
-async def _handle_2fa(page: Page, otp_key: str) -> None:
+async def _check_remember_device(page: Page) -> None:
+    try:
+        await page.check("input[type='checkbox']", timeout=2_000)
+        logger.debug("Checked 'Remember this device'")
+    except Exception:
+        pass
+
+
+async def _submit_2fa_code(page: Page) -> None:
+    await asyncio.sleep(1)
+    for sel in ["#logInBtn", "a.otkbtn-primary", "button[type='submit']",
+                "a:has-text('NEXT')", ".otkbtn-primary"]:
+        try:
+            await page.click(sel, timeout=3_000)
+            logger.info("2FA submit clicked via selector: %s", sel)
+            break
+        except Exception:
+            continue
+    await page.wait_for_load_state("networkidle", timeout=15_000)
+
+
+async def _handle_2fa_totp(page: Page, otp_key: str) -> None:
     """
-    Handle the full EA 2-FA flow:
-      1. "Verify your identity" page  →  select App Authenticator, click Send Code
-      2. OTP entry page               →  fill code, submit
-    Both stages are detected by waiting for their key elements; if neither
-    appears the function returns silently (already past 2-FA).
+    1. "Verify your identity" page  ->  select App Authenticator, send code
+    2. OTP entry page               ->  fill code, submit
+    Returns silently if neither stage appears (already past 2-FA).
     """
-    # --- Stage 1: "Verify your identity" page ---
     try:
         await page.wait_for_selector(SEL_BTN_SEND_CODE, timeout=8_000)
         logger.info("'Verify your identity' page detected — selecting App Authenticator…")
@@ -103,7 +200,6 @@ async def _handle_2fa(page: Page, otp_key: str) -> None:
     except PWTimeout:
         logger.debug("No 'Verify your identity' page — checking for OTP input directly")
 
-    # --- Stage 2: OTP entry ---
     otp_selector: str | None = None
     for sel in SEL_OTP_INPUTS:
         try:
@@ -117,7 +213,6 @@ async def _handle_2fa(page: Page, otp_key: str) -> None:
         logger.debug("No OTP prompt found — continuing")
         return
 
-    # Avoid submitting a code that's about to expire
     rem = remaining_seconds(otp_key)
     if rem < OTP_MIN_REMAINING:
         logger.info("OTP expires in %ds — waiting for fresh window…", rem)
@@ -128,26 +223,48 @@ async def _handle_2fa(page: Page, otp_key: str) -> None:
     await page.fill(otp_selector, code)
     await asyncio.sleep(0.3)
 
-    # Tick "Remember this device" if the checkbox is present
+    await _check_remember_device(page)
+    await _submit_2fa_code(page)
+
+
+async def _handle_2fa_backup_code(page: Page, backup_code: str) -> None:
+    """
+    UNVERIFIED best-effort flow:
+      1. "Verify your identity" page -> switch to the backup-code option
+      2. Backup-code entry page      -> fill code, submit
+    Backup codes are single-use, so this should only ever be called once per
+    account (during first_login). Returns silently if no 2FA prompt appears.
+    """
     try:
-        await page.check("input[type='checkbox']", timeout=2_000)
-        logger.debug("Checked 'Remember this device'")
-    except Exception:
-        pass
-
-    # Wait for the code to register before submitting
-    await asyncio.sleep(1)
-
-    for sel in ["#logInBtn", "a.otkbtn-primary", "button[type='submit']",
-                "a:has-text('NEXT')", ".otkbtn-primary"]:
+        await page.wait_for_selector(SEL_BTN_SEND_CODE, timeout=8_000)
+        logger.info("'Verify your identity' page detected — switching to backup code…")
         try:
-            await page.click(sel, timeout=3_000)
-            logger.info("OTP submit clicked via selector: %s", sel)
-            break
+            await page.click(SEL_USE_ANOTHER_WAY, timeout=5_000)
+            await asyncio.sleep(0.3)
         except Exception:
+            logger.debug("No explicit 'use another way' link found — trying direct backup-code input")
+    except PWTimeout:
+        logger.debug("No 'Verify your identity' page — checking for backup-code input directly")
+
+    code_selector: str | None = None
+    for sel in SEL_BACKUP_CODE_INPUTS:
+        try:
+            await page.wait_for_selector(sel, timeout=8_000)
+            code_selector = sel
+            break
+        except PWTimeout:
             continue
 
-    await page.wait_for_load_state("networkidle", timeout=15_000)
+    if code_selector is None:
+        logger.warning("No backup-code input found — 2FA flow may have changed")
+        return
+
+    logger.info("Entering backup code…")
+    await page.fill(code_selector, backup_code)
+    await asyncio.sleep(0.3)
+
+    await _check_remember_device(page)
+    await _submit_2fa_code(page)
 
 
 async def _capture_ut_session(
@@ -156,12 +273,7 @@ async def _capture_ut_session(
     captured: dict[str, Any],
     timeout: float = 60.0,
 ) -> SessionData | None:
-    """
-    Wait until the UT session headers have been populated in *captured*.
-    Listeners must be registered on the page BEFORE navigation starts so
-    that early accountinfo XHRs are not missed.
-    """
-    # Wait for SID only — phishing_token has multiple fallback sources
+    """Wait until UT session headers have been populated in *captured*."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if captured.get("sid"):
@@ -169,14 +281,12 @@ async def _capture_ut_session(
         await asyncio.sleep(0.4)
     else:
         logger.error(
-            "Timed out waiting for UT SID "
-            "(SID present=%s, phishing_token present=%s)",
+            "Timed out waiting for UT SID (SID present=%s, phishing_token present=%s)",
             bool(captured.get("sid")),
             bool(captured.get("phishing_token")),
         )
         return None
 
-    # phishing_token starts at "0" on new sessions; don't fail if absent
     captured.setdefault("phishing_token", "0")
     if captured["phishing_token"] == "0":
         logger.warning("phishing_token not captured — defaulting to '0'")
@@ -198,150 +308,128 @@ async def _capture_ut_session(
 # ---------------------------------------------------------------------------
 
 
-async def login_to_fc(
+async def first_login(
+    page: Page,
+    *,
     account_id: int,
     email: str,
     password: str,
-    otp_key: str,
-    *,
-    headless: bool = False,
-    max_attempts: int = 3,
+    otp_key: str = "",
+    backup_code: str = "",
+    max_attempts: int = 2,
 ) -> SessionData | None:
     """
-    Log into the FC Companion Web App and return a populated SessionData.
+    Run the full credential + 2FA flow on *page* (a page from the account's
+    persistent context). Ticks "remember this device" so future restores can
+    skip 2FA. Prefers TOTP when an otp_key is configured; falls back to the
+    (unverified) backup-code flow otherwise.
 
-    Retries up to *max_attempts* times on transient failures.
-    Persists the session to the DB on success.
-    Returns None if all attempts fail.
+    Backup codes are single-use — max_attempts is kept low for that path
+    since a retry would resubmit the same already-consumed code.
     """
+    use_backup_code = not otp_key and bool(backup_code)
+    if use_backup_code:
+        max_attempts = min(max_attempts, 2)
+
     for attempt in range(1, max_attempts + 1):
         logger.info(
-            "Login attempt %d/%d for account %d (%s)",
-            attempt,
-            max_attempts,
-            account_id,
-            email,
+            "First login attempt %d/%d for account %d (%s)",
+            attempt, max_attempts, account_id, email,
         )
-        session = await _single_login_attempt(
-            account_id, email, password, otp_key, headless=headless
-        )
-        if session:
-            await save_session(session)
-            logger.info("Login successful for account %d", account_id)
-            return session
-
-        if attempt < max_attempts:
-            backoff = 5 * attempt
-            logger.warning("Attempt %d failed — retrying in %ds…", attempt, backoff)
-            await asyncio.sleep(backoff)
-
-    logger.error("All login attempts failed for account %d", account_id)
-    return None
-
-
-async def _single_login_attempt(
-    account_id: int,
-    email: str,
-    password: str,
-    otp_key: str,
-    *,
-    headless: bool,
-) -> SessionData | None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless)
-        context: BrowserContext = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-        )
-        page = await context.new_page()
-
         try:
-            # Register UT session listeners before any navigation so that
-            # early accountinfo XHRs fired during Web App load are not missed.
-            captured: dict[str, Any] = {}
-
-            def _on_request(req: Request) -> None:
-                if "utas" in req.url and req.headers.get("x-ut-sid"):
-                    logger.info("UT request intercepted: %s", req.url)
-                    logger.info("Headers found: %s", list(req.headers.keys()))
-                    captured.setdefault("sid", req.headers.get("x-ut-sid", ""))
-                    captured.setdefault(
-                        "phishing_token",
-                        req.headers.get("x-ut-phishing-token", ""),
-                    )
-
-            async def _on_response(resp: Response) -> None:
-                if "utas" not in resp.url:
-                    return
-
-                # phishing_token may arrive in response headers
-                token = resp.headers.get("x-ut-phishing-token", "")
-                if token:
-                    captured.setdefault("phishing_token", token)
-                    logger.info("Captured phishing_token from response headers: %s", resp.url)
-
-                if "accountinfo" in resp.url:
-                    try:
-                        body = await resp.json()
-                        # phishing_token may also be in the response body
-                        body_token = (
-                            body.get("phishingToken", "")
-                            or body.get("phishing_token", "")
-                        )
-                        if body_token:
-                            captured.setdefault("phishing_token", body_token)
-                            logger.info("Captured phishing_token from response body")
-
-                        personas = body.get("userAccountInfo", {}).get("personas", [{}])
-                        captured.setdefault(
-                            "nucleus_id",
-                            str(personas[0].get("nucleusId", "")) if personas else "",
-                        )
-                        logger.debug("Captured nucleusId from accountinfo response")
-                    except Exception as exc:
-                        logger.debug("Could not parse accountinfo response: %s", exc)
-
-            page.on("request", _on_request)
-            page.on("response", _on_response)
-
-            # Step 1: open FC Web App (will redirect to EA login)
-            logger.debug("Navigating to FC Web App…")
-            await page.goto(FC_WEBAPP_URL, timeout=30_000)
-
-            # Some regions show a "Log In" button before the EA login page
-            try:
-                await page.wait_for_selector(
-                    "a[href*='login'], button:has-text('Login'), .btn-login",
-                    timeout=15_000,
-                )
-                await page.click("a[href*='login'], button:has-text('Login'), .btn-login")
-                # Wait for EA login page to load after clicking
-                await page.wait_for_selector(SEL_EMAIL, timeout=20_000)
-            except PWTimeout:
-                pass  # already on login form
-
-            # Step 2 & 3: credentials
+            captured = _register_session_listeners(page)
+            await _goto_webapp(page)
             await _fill_credentials(page, email, password)
 
-            # Step 4: optional 2-FA
-            await _handle_2fa(page, otp_key)
+            if otp_key:
+                await _handle_2fa_totp(page, otp_key)
+            elif backup_code:
+                await _handle_2fa_backup_code(page, backup_code)
 
-            # Step 5: wait for Web App shell
-            logger.debug("Waiting for Web App to finish loading…")
             await page.wait_for_url("**/web-app/**", timeout=40_000)
             await page.wait_for_load_state("networkidle", timeout=30_000)
 
-            # Step 6-7: grab session from network traffic
             session = await _capture_ut_session(page, account_id, captured)
-            return session
+            if session:
+                logger.info("First login successful for account %d", account_id)
+                return session
+        except Exception:
+            logger.exception("First login attempt error for account %d", account_id)
 
-        except Exception as exc:
-            logger.exception("Login attempt error for account %d: %s", account_id, exc)
+        if attempt < max_attempts:
+            await asyncio.sleep(5 * attempt)
+
+    logger.error("All first-login attempts failed for account %d", account_id)
+    return None
+
+
+async def restore_session(
+    page: Page,
+    *,
+    account_id: int,
+    timeout: float = 30.0,
+) -> SessionData | None:
+    """
+    Navigate the persistent page to the web app and capture a fresh session
+    using the profile's existing cookies/local storage — no credentials are
+    entered. Returns None if the login form appears (the profile's session
+    actually died and the caller should fall back to a password-only re-login).
+    """
+    captured = _register_session_listeners(page)
+    try:
+        await _goto_webapp(page)
+
+        # If the profile is still authenticated, the email field never
+        # appears — the web app loads straight away.
+        try:
+            await page.wait_for_selector(SEL_EMAIL, timeout=5_000)
+            logger.info("Account %d: login form appeared — persistent session has died", account_id)
             return None
+        except PWTimeout:
+            pass  # good: no login form, already authenticated
 
-        finally:
-            await browser.close()
+        await page.wait_for_url("**/web-app/**", timeout=timeout * 1000)
+        await page.wait_for_load_state("networkidle", timeout=30_000)
+        return await _capture_ut_session(page, account_id, captured, timeout=timeout)
+    except Exception:
+        logger.exception("Session restore error for account %d", account_id)
+        return None
+
+
+async def password_relogin(
+    page: Page,
+    *,
+    account_id: int,
+    email: str,
+    password: str,
+) -> SessionData | None:
+    """
+    Re-authenticate with email + password only (no 2FA), relying on the
+    persistent profile's "remembered device" cookie to skip it. If EA still
+    prompts for 2FA here, this returns None — the caller must not retry with
+    a backup code automatically (single-use) and should alert an admin.
+    """
+    captured = _register_session_listeners(page)
+    try:
+        await _goto_webapp(page)
+        await _fill_credentials(page, email, password)
+
+        # If 2FA shows up despite the remembered device, bail rather than
+        # silently failing deeper in the flow.
+        for sel in (SEL_BTN_SEND_CODE, *SEL_OTP_INPUTS, *SEL_BACKUP_CODE_INPUTS):
+            try:
+                await page.wait_for_selector(sel, timeout=3_000)
+                logger.warning(
+                    "Account %d: 2FA required during password-only re-login — manual intervention needed",
+                    account_id,
+                )
+                return None
+            except PWTimeout:
+                continue
+
+        await page.wait_for_url("**/web-app/**", timeout=40_000)
+        await page.wait_for_load_state("networkidle", timeout=30_000)
+        return await _capture_ut_session(page, account_id, captured)
+    except Exception:
+        logger.exception("Password-only re-login error for account %d", account_id)
+        return None
