@@ -1,14 +1,18 @@
 """
-BrowserPool — owns one persistent Chromium context per EA account.
+BrowserPool — owns one persistent Chromium context per logged-in EA account.
+
+Login/logout is admin-driven (via /accounts and /logout in Telegram):
+  - login_account(id)   first login consumes the single-use backup code and
+                        saves the persistent profile; later logins restore
+                        silently from that profile.
+  - logout_account(id)  closes the browser context and clears the logged-in
+                        flag; the on-disk profile is kept so the next login
+                        is credential-free.
+  - start()             restores, on app startup, every account the admin had
+                        logged in before the restart (is_logged_in = 1).
 
 OrderWorkers never launch browsers or authenticate directly; they call
-get_session()/force_relogin() on the pool and trade over httpx exactly as
-before. The pool is responsible for:
-  - launching/keeping alive one persistent Chrome profile per account
-  - first-time credential login (TOTP or backup code)
-  - silent session restoration on subsequent runs (no re-entering credentials)
-  - health-checking pages and relaunching crashed browsers from the same
-    on-disk profile
+get_session()/force_relogin() on the pool and trade over httpx.
 """
 
 import asyncio
@@ -23,9 +27,12 @@ from auth.session import SessionData, save_session
 from bot.notifications import safe_send
 from config import ADMIN_IDS, BROWSER_HEADLESS, BROWSER_HEALTH_CHECK_INTERVAL_S
 from db.database import (
-    get_all_accounts,
+    clear_backup_code,
+    get_account_by_id,
+    get_logged_in_accounts,
     mark_first_login_done,
     set_account_status,
+    set_logged_in,
     set_profile_path,
 )
 
@@ -45,7 +52,6 @@ class _PoolEntry:
     account_id: int
     email: str
     password: str
-    otp_key: str
     backup_code: str
     context: BrowserContext
     page: Page
@@ -64,10 +70,15 @@ class BrowserPool:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
+        """Restore every account the admin had logged in before the restart."""
         self._pw = await async_playwright().start()
-        for account in await get_all_accounts():
-            await self._provision(account)
-        logger.info("BrowserPool ready: %d account(s) authenticated", len(self._entries))
+        for account in await get_logged_in_accounts():
+            session = await self._provision(account)
+            if session is None:
+                # Restore failed — reflect reality so /accounts shows it
+                # as logged out and the admin can retry from Telegram.
+                await set_logged_in(account["id"], False)
+        logger.info("BrowserPool ready: %d account(s) restored", len(self._entries))
 
     async def _launch_context(self, account_id: int) -> BrowserContext:
         assert self._pw is not None
@@ -78,38 +89,40 @@ class BrowserPool:
             viewport={"width": 1280, "height": 800},
         )
 
-    async def _provision(self, account: dict) -> None:
+    async def _provision(self, account: dict) -> SessionData | None:
         account_id = account["id"]
         email = account["email"]
         password = account["password"] or ""
-        otp_key = account["otp_key"] or ""
         backup_code = account["backup_code"] or ""
 
         if not password:
             logger.warning(
-                "Account %d (%s) has no password stored — cannot authenticate, skipping",
+                "Account %d (%s) has no password stored — cannot authenticate",
                 account_id, email,
             )
-            return
+            return None
 
         context = await self._launch_context(account_id)
         page = context.pages[0] if context.pages else await context.new_page()
         entry = _PoolEntry(
             account_id=account_id, email=email, password=password,
-            otp_key=otp_key, backup_code=backup_code,
-            context=context, page=page,
+            backup_code=backup_code, context=context, page=page,
         )
         self._entries[account_id] = entry
         await set_profile_path(account_id, str(profile_dir(account_id)))
 
         async with entry.lock:
-            session = await self._authenticate_entry(entry, first_login_done=bool(account["first_login_done"]))
+            session = await self._authenticate_entry(
+                entry, first_login_done=bool(account["first_login_done"])
+            )
             if session is None:
                 await set_account_status(account_id, "login_failed")
-                return
+                await self._close_entry(account_id)
+                return None
             entry.session = session
             await save_session(session)
             logger.info("Account %d (%s): browser session ready", account_id, email)
+            return session
 
     async def _authenticate_entry(self, entry: "_PoolEntry", *, first_login_done: bool) -> SessionData | None:
         """Caller must hold entry.lock."""
@@ -119,16 +132,18 @@ class BrowserPool:
                 account_id=entry.account_id,
                 email=entry.email,
                 password=entry.password,
-                otp_key=entry.otp_key,
                 backup_code=entry.backup_code,
             )
             if session:
                 await mark_first_login_done(entry.account_id)
+                # The backup code is spent — wipe it so it is never resubmitted.
+                await clear_backup_code(entry.account_id)
+                entry.backup_code = ""
             else:
                 logger.error("Account %d (%s): first login failed", entry.account_id, entry.email)
                 await self._alert_admins(
                     f"❌ Account {entry.account_id} ({entry.email}): first login failed. "
-                    "Manual intervention required."
+                    "Check the credentials/backup code and try again."
                 )
             return session
 
@@ -148,12 +163,61 @@ class BrowserPool:
             await self._alert_admins(
                 f"❌ Account {entry.account_id} ({entry.email}): could not restore session "
                 "and password-only re-login failed. EA may be asking for 2FA again — "
-                "manual intervention required."
+                "a fresh backup code is needed."
             )
         return session
 
     # ------------------------------------------------------------------
-    # Runtime
+    # Admin-driven login / logout
+    # ------------------------------------------------------------------
+
+    async def login_account(self, account_id: int) -> SessionData | None:
+        """
+        Log an account in on the admin's request and keep it logged in.
+        Idempotent: returns the current session if already pooled.
+        """
+        entry = self._entries.get(account_id)
+        if entry is not None and entry.session is not None:
+            await set_logged_in(account_id, True)
+            return entry.session
+
+        account = await get_account_by_id(account_id)
+        if account is None or account["status"] == "disabled":
+            logger.error("login_account: account %d not found or disabled", account_id)
+            return None
+
+        session = await self._provision(account)
+        if session is not None:
+            await set_logged_in(account_id, True)
+            # A previously failed account is clearly working again.
+            if account["status"] == "login_failed":
+                await set_account_status(account_id, "active")
+        return session
+
+    async def logout_account(self, account_id: int) -> bool:
+        """
+        Close the account's browser and mark it logged out. The on-disk
+        profile survives, so logging back in is credential-free.
+        """
+        await self._close_entry(account_id)
+        await set_logged_in(account_id, False)
+        logger.info("Account %d logged out", account_id)
+        return True
+
+    def is_pooled(self, account_id: int) -> bool:
+        return account_id in self._entries
+
+    async def _close_entry(self, account_id: int) -> None:
+        entry = self._entries.pop(account_id, None)
+        if entry is None:
+            return
+        try:
+            await entry.context.close()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Runtime (used by workers)
     # ------------------------------------------------------------------
 
     async def get_session(self, account_id: int) -> SessionData | None:
@@ -242,6 +306,7 @@ class BrowserPool:
                 await entry.context.close()
             except Exception:
                 pass
+        self._entries.clear()
         if self._pw:
             await self._pw.stop()
         logger.info("BrowserPool stopped")

@@ -6,10 +6,11 @@ browser context owned by browser_pool.BrowserPool — this module never
 launches or closes a browser itself.
 
 first_login()
-    Full credential flow: email -> password -> 2FA (TOTP or backup code) ->
-    capture session. Used once per account, the first time its persistent
-    profile is created. Ticks "remember this device" so subsequent restores
-    skip 2FA.
+    Full credential flow: email -> password -> backup code -> capture
+    session. Used once per account, the first time its persistent profile
+    is created. Ticks "remember this device" so subsequent restores skip
+    2FA. Backup codes are single-use — the caller wipes the stored code
+    after a successful first login.
 
 restore_session()
     Navigates the already-authenticated persistent page to the web app and
@@ -35,7 +36,6 @@ from playwright.async_api import (
     TimeoutError as PWTimeout,
 )
 
-from .otp import generate_otp, remaining_seconds
 from .session import SessionData
 
 logger = logging.getLogger(__name__)
@@ -51,14 +51,7 @@ SEL_EMAIL = "#email"
 SEL_BTN_NEXT = "#logInBtn"
 SEL_PASSWORD = "#password"
 SEL_BTN_SIGNIN = "#logInBtn"
-SEL_OTP_INPUTS = ["input[placeholder*='6 digit']", "#codeEntry", "input[name='codeEntry']"]
-SEL_BTN_OTP_SUBMIT = ["#logInBtn"]
 # "Verify your identity" intermediate page
-SEL_AUTHENTICATOR = (
-    "div.origin-ux-radio-button-control:has-text('App Authenticator'), "
-    "input[value*='authenticator'], "
-    "div[class*='radio']:has-text('Authenticator')"
-)
 SEL_BTN_SEND_CODE = "#btnSendCode"
 
 # Backup-code 2FA — UNVERIFIED, best-effort selectors
@@ -76,9 +69,6 @@ SEL_BACKUP_CODE_INPUTS = [
 
 # UT API fingerprint — we listen for this URL to grab session headers
 UT_ACCOUNTINFO_PATTERN = "utas"  # broad match; narrowed further in the handler
-
-# Minimum OTP window remaining before we wait for the next one
-OTP_MIN_REMAINING = 5  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -184,49 +174,6 @@ async def _submit_2fa_code(page: Page) -> None:
     await page.wait_for_load_state("networkidle", timeout=15_000)
 
 
-async def _handle_2fa_totp(page: Page, otp_key: str) -> None:
-    """
-    1. "Verify your identity" page  ->  select App Authenticator, send code
-    2. OTP entry page               ->  fill code, submit
-    Returns silently if neither stage appears (already past 2-FA).
-    """
-    try:
-        await page.wait_for_selector(SEL_BTN_SEND_CODE, timeout=8_000)
-        logger.info("'Verify your identity' page detected — selecting App Authenticator…")
-        await page.click(SEL_AUTHENTICATOR)
-        await asyncio.sleep(0.3)
-        await page.click(SEL_BTN_SEND_CODE)
-        logger.debug("Clicked Send Code — waiting for OTP input…")
-    except PWTimeout:
-        logger.debug("No 'Verify your identity' page — checking for OTP input directly")
-
-    otp_selector: str | None = None
-    for sel in SEL_OTP_INPUTS:
-        try:
-            await page.wait_for_selector(sel, timeout=8_000)
-            otp_selector = sel
-            break
-        except PWTimeout:
-            continue
-
-    if otp_selector is None:
-        logger.debug("No OTP prompt found — continuing")
-        return
-
-    rem = remaining_seconds(otp_key)
-    if rem < OTP_MIN_REMAINING:
-        logger.info("OTP expires in %ds — waiting for fresh window…", rem)
-        await asyncio.sleep(rem + 1)
-
-    code = generate_otp(otp_key)
-    logger.info("Entering OTP code…")
-    await page.fill(otp_selector, code)
-    await asyncio.sleep(0.3)
-
-    await _check_remember_device(page)
-    await _submit_2fa_code(page)
-
-
 async def _handle_2fa_backup_code(page: Page, backup_code: str) -> None:
     """
     UNVERIFIED best-effort flow:
@@ -314,23 +261,17 @@ async def first_login(
     account_id: int,
     email: str,
     password: str,
-    otp_key: str = "",
     backup_code: str = "",
     max_attempts: int = 2,
 ) -> SessionData | None:
     """
-    Run the full credential + 2FA flow on *page* (a page from the account's
-    persistent context). Ticks "remember this device" so future restores can
-    skip 2FA. Prefers TOTP when an otp_key is configured; falls back to the
-    (unverified) backup-code flow otherwise.
+    Run the full credential + backup-code flow on *page* (a page from the
+    account's persistent context). Ticks "remember this device" so future
+    restores can skip 2FA.
 
-    Backup codes are single-use — max_attempts is kept low for that path
-    since a retry would resubmit the same already-consumed code.
+    Backup codes are single-use — max_attempts is kept low since a retry
+    would resubmit the same already-consumed code.
     """
-    use_backup_code = not otp_key and bool(backup_code)
-    if use_backup_code:
-        max_attempts = min(max_attempts, 2)
-
     for attempt in range(1, max_attempts + 1):
         logger.info(
             "First login attempt %d/%d for account %d (%s)",
@@ -341,9 +282,7 @@ async def first_login(
             await _goto_webapp(page)
             await _fill_credentials(page, email, password)
 
-            if otp_key:
-                await _handle_2fa_totp(page, otp_key)
-            elif backup_code:
+            if backup_code:
                 await _handle_2fa_backup_code(page, backup_code)
 
             await page.wait_for_url("**/web-app/**", timeout=40_000)
@@ -416,7 +355,7 @@ async def password_relogin(
 
         # If 2FA shows up despite the remembered device, bail rather than
         # silently failing deeper in the flow.
-        for sel in (SEL_BTN_SEND_CODE, *SEL_OTP_INPUTS, *SEL_BACKUP_CODE_INPUTS):
+        for sel in (SEL_BTN_SEND_CODE, *SEL_BACKUP_CODE_INPUTS):
             try:
                 await page.wait_for_selector(sel, timeout=3_000)
                 logger.warning(

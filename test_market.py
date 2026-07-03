@@ -20,9 +20,8 @@ import sys
 import logging
 
 from utils.logger import setup_logging
-from db.database import init_db, get_account_db_id
+from db.database import init_db, get_all_accounts
 from auth.session import load_session
-from config import EA_ACCOUNTS
 from market.buyer import search_card
 
 
@@ -36,15 +35,12 @@ async def main() -> None:
     # ── 1. Init DB & resolve account id ───────────────────────────────────
     await init_db()
 
-    if not EA_ACCOUNTS:
-        logger.error("No EA accounts found in .env — add EA_ACCOUNT_1_* variables")
+    accounts = await get_all_accounts()
+    if not accounts:
+        logger.error("No EA accounts in DB — add one via the bot's /addaccount first")
         return
 
-    first_account = EA_ACCOUNTS[0]
-    account_id = await get_account_db_id(first_account["email"])
-    if account_id is None:
-        logger.error("Account not found in DB for email: %s", first_account["email"])
-        return
+    account_id: int = accounts[0]["id"]
 
     # ── 2. Load session ────────────────────────────────────────────────────
     session = await load_session(account_id)

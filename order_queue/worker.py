@@ -141,7 +141,9 @@ class OrderWorker:
 
         quantity: int = order["quantity"]
         card_name: str = order["card_name"]
-        client_telegram_id: int = order["client_telegram_id"]
+        # Telegram ID of the admin who placed the order (None on orders that
+        # predate the client-removal migration — notifications are skipped).
+        ordered_by: int | None = order["ordered_by"]
         list_price: int = order["list_price"]
 
         # ── Mark running ──────────────────────────────────────────────────────
@@ -189,35 +191,38 @@ class OrderWorker:
                 f"Reason: {exc.reason}\n"
                 f"Cards listed before abort: {cards_listed}"
             )
-            await safe_send(
-                self.bot,
-                client_telegram_id,
-                f"⚠️ سفارش شما متوقف شد — {cards_listed} از {quantity} کارت لیست شد.\n"
-                "لطفاً با ادمین تماس بگیرید.",
-            )
+            if ordered_by:
+                await safe_send(
+                    self.bot,
+                    ordered_by,
+                    f"⚠️ سفارش متوقف شد — {cards_listed} از {quantity} کارت لیست شد.",
+                )
             return
 
         # ── Order complete ────────────────────────────────────────────────────
         await update_order_status(order_id, "done")
         logger.info("Order #%d complete — %d cards listed", order_id, quantity)
 
+        if not ordered_by:
+            return
+
         try:
             transactions = await get_transactions_for_order(order_id)
             logger.info(
-                "Order #%d complete. client_id=%s transactions=%d",
-                order_id, client_telegram_id, len(transactions),
+                "Order #%d complete. ordered_by=%s transactions=%d",
+                order_id, ordered_by, len(transactions),
             )
             await send_order_complete(
                 bot=self.bot,
-                client_telegram_id=client_telegram_id,
+                client_telegram_id=ordered_by,
                 order_id=order_id,
                 order_amount=order["order_amount"],
                 transactions=transactions,
             )
         except Exception:
             logger.exception(
-                "Order #%d: failed to send completion notification to client %s",
-                order_id, client_telegram_id,
+                "Order #%d: failed to send completion notification to %s",
+                order_id, ordered_by,
             )
 
     async def _do_process(
@@ -549,23 +554,24 @@ class OrderWorker:
                 cards_listed,
                 quantity,
             )
-            # Tell the client right away — the final summary only goes out once
-            # the whole order is done, which can take a while.
+            # Tell the ordering admin right away — the final summary only goes
+            # out once the whole order is done, which can take a while.
             try:
-                await send_card_listed(
-                    bot=self.bot,
-                    client_telegram_id=card_config["client_telegram_id"],
-                    player_name=held["player_name"],
-                    # lister floors the bid to a 100-coin tier; show the
-                    # same value the auction actually uses
-                    start_bid=(start_bid // 100) * 100,
-                    buy_now=list_price,
-                    cards_done=cards_listed,
-                    total=quantity,
-                )
+                if card_config["ordered_by"]:
+                    await send_card_listed(
+                        bot=self.bot,
+                        client_telegram_id=card_config["ordered_by"],
+                        player_name=held["player_name"],
+                        # lister floors the bid to a 100-coin tier; show the
+                        # same value the auction actually uses
+                        start_bid=(start_bid // 100) * 100,
+                        buy_now=list_price,
+                        cards_done=cards_listed,
+                        total=quantity,
+                    )
             except Exception:
                 logger.warning(
-                    "Order #%d: could not send card-listed message to client",
+                    "Order #%d: could not send card-listed message",
                     order_id,
                     exc_info=True,
                 )

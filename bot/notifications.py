@@ -206,9 +206,10 @@ def _build_report_text(row: dict) -> str:
     profit_per_card = (list_price * 0.95) - avg_bought
     total_profit = profit_per_card * card_count / 100_000 * order_amount
 
+    ordered_by = row.get("telegram_id") or "—"
     return (
         "📊 <b>Accounting Report</b>\n\n"
-        f"Client: <code>{row['telegram_id']}</code>\n"
+        f"Ordered by: <code>{ordered_by}</code>\n"
         f"Card: <b>{row['card_name']}</b>\n"
         f"Cards bought: <b>{card_count}</b>\n"
         f"Avg bought price: <b>{avg_bought:,}</b>\n"

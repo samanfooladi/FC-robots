@@ -3,16 +3,16 @@ QueueManager — lifecycle manager for all per-account OrderWorkers.
 
 Responsibilities
 ────────────────
-1. On startup: spawn one OrderWorker task per active EA account that the
-   BrowserPool has successfully authenticated.
-2. On startup: re-queue any orders that were pending/in_progress when the
-   bot last shut down (crash-safe restart).
-3. On new order: route it to the correct worker queue.
-4. Expose queue depth per account for monitoring.
+1. On startup: spawn one OrderWorker per account the BrowserPool restored
+   (accounts the admin had logged in before the restart), and re-queue
+   their surviving pending orders.
+2. On admin login (/accounts): start_worker() spawns that account's worker
+   and re-queues its pending orders.
+3. On admin logout (/logout): stop_worker() cancels the worker task.
+4. On new order: route it to the chosen account's worker queue.
 
-The BrowserPool (browser_pool.pool.BrowserPool) must already be started
-before QueueManager.start() is called — workers pull sessions from it and
-never authenticate themselves.
+Orders for accounts that are currently logged out simply stay 'pending' in
+the DB — they are enqueued automatically when that account logs in.
 """
 
 import asyncio
@@ -21,9 +21,10 @@ from aiogram import Bot
 
 from browser_pool.pool import BrowserPool
 from db.database import (
-    get_all_accounts,
-    get_all_pending_orders,
+    get_account_by_id,
+    get_logged_in_accounts,
     get_order_by_id,
+    get_pending_orders_for_account,
 )
 from order_queue.worker import OrderWorker
 
@@ -35,7 +36,7 @@ class QueueManager:
         self.bot = bot
         self.browser_pool = browser_pool
         self.workers: dict[int, OrderWorker] = {}
-        self._tasks: list[asyncio.Task] = []
+        self._tasks: dict[int, asyncio.Task] = {}
 
     # ─────────────────────────────────────────────────────────────────────────
     # Startup
@@ -44,62 +45,74 @@ class QueueManager:
     async def start(self) -> None:
         """
         Called once from main.py after the BrowserPool has been started.
-        Spawns workers and re-queues any surviving pending orders.
+        Spawns workers for restored (logged-in) accounts and re-queues their
+        surviving pending orders.
         """
         logger.info("QueueManager starting…")
 
-        for account in await get_all_accounts():
-            account_id: int = account["id"]
-            email: str = account["email"]
+        for account in await get_logged_in_accounts():
+            await self.start_worker(account["id"])
 
-            session = await self.browser_pool.get_session(account_id)
-            if session is None:
-                logger.error(
-                    "Account %d (%s): BrowserPool has no session — worker will not be started",
-                    account_id,
-                    email,
-                )
-                continue
+        logger.info("QueueManager ready: %d worker(s)", len(self.workers))
 
-            worker = OrderWorker(
-                account_id=account_id,
-                email=email,
-                session=session,
-                bot=self.bot,
-                browser_pool=self.browser_pool,
-            )
-            self.workers[account_id] = worker
-            task = asyncio.create_task(
-                worker.run(),
-                name=f"worker-account-{account_id}",
-            )
-            self._tasks.append(task)
-            logger.info("Worker started for account %d (%s)", account_id, email)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Worker lifecycle (admin-driven)
+    # ─────────────────────────────────────────────────────────────────────────
 
-        # Re-queue orders that were in-flight when the bot last stopped
-        pending = await get_all_pending_orders()
-        for row in pending:
-            order_id: int = row["id"]
-            account_id: int = row["account_id"]
-            if account_id in self.workers:
-                await self.workers[account_id].queue.put(order_id)
-                logger.info(
-                    "Re-queued order #%d → account %d (startup recovery)",
-                    order_id,
-                    account_id,
-                )
-            else:
-                logger.warning(
-                    "Order #%d belongs to account %d but no worker exists — order stuck",
-                    order_id,
-                    account_id,
-                )
+    async def start_worker(self, account_id: int) -> bool:
+        """
+        Spawn a worker for one account (startup restore or /accounts login)
+        and re-queue its pending orders. Idempotent — returns True if a
+        worker already exists.
+        """
+        if account_id in self.workers:
+            return True
 
-        logger.info(
-            "QueueManager ready: %d worker(s), %d order(s) re-queued",
-            len(self.workers),
-            len(pending),
+        account = await get_account_by_id(account_id)
+        if account is None:
+            logger.error("start_worker: account %d not found", account_id)
+            return False
+
+        session = await self.browser_pool.get_session(account_id)
+        if session is None:
+            logger.error("start_worker: BrowserPool has no session for account %d", account_id)
+            return False
+
+        worker = OrderWorker(
+            account_id=account_id,
+            email=account["email"],
+            session=session,
+            bot=self.bot,
+            browser_pool=self.browser_pool,
         )
+        self.workers[account_id] = worker
+        self._tasks[account_id] = asyncio.create_task(
+            worker.run(), name=f"worker-account-{account_id}"
+        )
+        logger.info("Worker started for account %d (%s)", account_id, account["email"])
+
+        # Orders placed (or interrupted) while this account was logged out
+        # have been waiting in the DB — pick them up now.
+        pending = await get_pending_orders_for_account(account_id)
+        for row in pending:
+            await worker.queue.put(row["id"])
+            logger.info("Re-queued order #%d → account %d", row["id"], account_id)
+
+        return True
+
+    async def stop_worker(self, account_id: int) -> bool:
+        """Cancel one account's worker task (admin /logout)."""
+        task = self._tasks.pop(account_id, None)
+        self.workers.pop(account_id, None)
+        if task is None:
+            return False
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        logger.info("Worker stopped for account %d", account_id)
+        return True
 
     # ─────────────────────────────────────────────────────────────────────────
     # Runtime
@@ -144,8 +157,11 @@ class QueueManager:
 
     async def stop(self) -> None:
         """Cancel all worker tasks gracefully."""
-        for task in self._tasks:
+        tasks = list(self._tasks.values())
+        for task in tasks:
             task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+        self.workers.clear()
         logger.info("QueueManager stopped — all worker tasks cancelled")
