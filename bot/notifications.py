@@ -44,30 +44,53 @@ async def safe_send(bot: Bot, chat_id: int, text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Per-card listing notification
+# DSFUT — new popped order / auto-created account
 # ---------------------------------------------------------------------------
 
 
-async def send_card_listed(
+def _fmt_order_hint(coins: int) -> str:
+    """90_000 → '90k' (matches the /order shorthand admins already use)."""
+    if coins >= 1000 and coins % 1000 == 0:
+        return f"{coins // 1000}k"
+    return f"{coins:,}"
+
+
+async def send_dsfut_order_created(
     bot: Bot,
-    client_telegram_id: int,
-    player_name: str,
-    start_bid: int,
-    buy_now: int,
-    cards_done: int,
-    total: int,
+    admin_ids: list[int],
+    *,
+    coins: int,
+    net_price: float | None,
+    email: str,
+    password: str,
+    backup_codes: str,
+    account_note: str = "",
 ) -> None:
-    """Notify the client that one card of their order is now listed."""
+    """
+    Tell every admin that a DSFUT console order was popped and its EA
+    account is ready. This message intentionally carries the credentials —
+    Telegram is the delivery channel to the admin; logs stay redacted.
+    """
     from html import escape
 
+    net_line = f"{net_price:.2f}$" if net_price is not None else "—"
+    codes_display = ", ".join(c for c in backup_codes.split(",") if c) or "—"
+
     text = (
-        f"🟢 <b>کارت شما لیست شد</b> ({cards_done}/{total})\n\n"
-        f"👤 {escape(player_name)}\n"
-        f"📦 تعداد: 1\n"
-        f"🏷 Start Bid: {start_bid:,}\n"
-        f"💵 Buy Now: {buy_now:,}"
+        "🤖 <b>DSFUT → Bot</b>\n\n"
+        "✅ A new account created.\n\n"
+        f"💰 amount order : <b>{coins:,}</b>\n"
+        f"💵 net price : <b>{net_line}</b>\n\n"
+        f"📧 email: <code>{escape(email) or '—'}</code>\n"
+        f"🔑 pass: <code>{escape(password) or '—'}</code>\n"
+        f"🧩 backup code: <code>{escape(codes_display)}</code>\n\n"
+        f"➡️ /accounts → login → <code>/order {_fmt_order_hint(coins)}</code>"
     )
-    await safe_send(bot, client_telegram_id, text)
+    if account_note:
+        text += f"\n\n⚠️ {escape(account_note)}"
+
+    for admin_id in admin_ids:
+        await safe_send(bot, admin_id, text)
 
 
 # ---------------------------------------------------------------------------

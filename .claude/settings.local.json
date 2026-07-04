@@ -1,7 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('market/credits.py'\\).read\\(\\)\\); ast.parse\\(open\\('bot/router_admin.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "WebFetch(domain:dsfut.net)",
+      "Bash(python -m py_compile dsfut/__init__.py dsfut/client.py dsfut/limiter.py dsfut/poller.py db/database.py config.py main.py bot/notifications.py auth/login.py utils/logger.py utils/redact.py)",
+      "Bash(python -)",
+      "Bash(python -m py_compile dsfut_browser/__init__.py dsfut_browser/board.py dsfut_browser/session.py dsfut_browser/poller.py dsfut_browser/__main__.py db/database.py config.py main.py)",
+      "Bash(python -c \"import config; print\\('config imports OK; DSFUT_ENABLED=', config.DSFUT_ENABLED, 'profile=', config.DSFUT_BROWSER_PROFILE_DIR, 'interval=', config.DSFUT_POLL_INTERVAL_S\\)\")",
+      "Bash(DB_PATH=\"C:/Users/saman/AppData/Local/Temp/claude/F--My-Projects-dooste-koni/f4174535-e3d3-4a2c-869b-24c140b88f91/scratchpad/race_test.db\" python -)"
     ]
   }
 }

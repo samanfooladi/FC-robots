@@ -21,11 +21,13 @@ import logging
 from aiogram import Bot
 from aiogram.types import BotCommand
 
+from config import DSFUT_ENABLED
 from utils.logger import setup_logging
 from db.database import init_db
 from bot import create_dispatcher
 from bot import bot  # shared Bot instance
 from browser_pool.pool import BrowserPool
+from dsfut_browser.poller import DsfutBrowserPoller
 from order_queue.manager import QueueManager
 from scheduler.runner import create_scheduler
 
@@ -83,10 +85,18 @@ async def main() -> None:
     scheduler.start()
     logger.info("Accounting scheduler started (every 9 hours)")
 
-    # 5. Register bot command menu
+    # 5. DSFUT poller — browser-drives the dsfut.net board to pick up console
+    #    orders (first captcha login is manual; see dsfut_browser)
+    dsfut_task = None
+    if DSFUT_ENABLED:
+        dsfut_task = asyncio.create_task(DsfutBrowserPoller(bot).run(), name="dsfut-poller")
+    else:
+        logger.info("DSFUT poller disabled — set DSFUT_ENABLED=true in .env to enable it")
+
+    # 6. Register bot command menu
     await _set_bot_commands(bot)
 
-    # 6. Start Telegram polling
+    # 7. Start Telegram polling
     dp = create_dispatcher()
     logger.info("Bot polling started — press Ctrl+C to stop")
     try:
@@ -99,6 +109,8 @@ async def main() -> None:
     finally:
         scheduler.shutdown(wait=False)
         logger.info("Scheduler stopped")
+        if dsfut_task:
+            dsfut_task.cancel()
         await queue_manager.stop()
         health_check_task.cancel()
         await browser_pool.stop()

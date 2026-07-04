@@ -44,6 +44,7 @@ from db.database import (
     list_all_cards,
     set_card,
 )
+from market.credits import get_credits
 
 if TYPE_CHECKING:
     from browser_pool.pool import BrowserPool
@@ -264,9 +265,13 @@ async def cb_account_login(
         )
         return
 
+    credits = await get_credits(session)
+    coins_line = f"\n\nCoins: {credits:,}" if credits is not None else ""
+
     await callback.message.edit_text(
         f"✅ Logged in successfully as <code>{account['email']}</code> — "
-        f"please send your order:  <code>/order 100k</code>",
+        f"please send your order:  <code>/order 100k</code>"
+        f"{coins_line}",
         parse_mode="HTML",
     )
 

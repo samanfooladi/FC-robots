@@ -3,6 +3,7 @@ import time
 import aiosqlite
 
 from config import DB_PATH
+from utils.redact import redact_email
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,31 @@ CREATE TABLE IF NOT EXISTS transactions (
     buynow_price    INTEGER NOT NULL,
     listed_at       REAL    NOT NULL DEFAULT (unixepoch())
 );
+
+CREATE TABLE IF NOT EXISTS dsfut_orders (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id      INTEGER UNIQUE,
+    trade_id            TEXT,
+    name                TEXT,
+    rating              INTEGER,
+    position            TEXT,
+    start_price         INTEGER,
+    buy_now_price       INTEGER,
+    amount              REAL,
+    net_price           REAL,
+    expires             INTEGER,
+    console             TEXT,
+    account_email       TEXT,
+    account_password    TEXT,
+    account_backup_code TEXT,
+    ea_account_id       INTEGER REFERENCES ea_accounts(id),
+    status              TEXT    NOT NULL DEFAULT 'new',
+    raw_json            TEXT,
+    created_at          REAL    NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_dsfut_orders_status
+    ON dsfut_orders (status, created_at);
 """
 
 # Additive migrations for databases created before new columns were added.
@@ -165,6 +191,10 @@ async def _migrate_legacy(db: aiosqlite.Connection) -> None:
 async def init_db() -> None:
     """Create tables, migrate legacy shapes, run additive migrations."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # WAL survives in the DB file and lets the DSFUT poller, the bot and
+        # any external consumer of dsfut_orders write concurrently without
+        # "database is locked" errors.
+        await db.execute("PRAGMA journal_mode=WAL")
         await db.executescript(_SCHEMA)
         await _migrate_legacy(db)
         for stmt in _MIGRATIONS:
@@ -199,8 +229,34 @@ async def add_account(email: str, password: str, backup_code: str) -> tuple[bool
         )
         new_id = cur.lastrowid
         await db.commit()
-    logger.info("Account added via bot: id=%d email=%s", new_id, email)
+    logger.info("Account added via bot: id=%d email=%s", new_id, redact_email(email))
     return True, str(new_id)
+
+
+async def update_account_credentials(
+    email: str, password: str, backup_code: str
+) -> int | None:
+    """
+    Refresh password/backup code of an existing account (a re-popped DSFUT
+    order may carry newer credentials). Returns the account id, or None if
+    no account with that email exists.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM ea_accounts WHERE email = ?", (email,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        account_id = row[0]
+        await db.execute(
+            "UPDATE ea_accounts SET password = ?, backup_code = ?, "
+            "updated_at = unixepoch() WHERE id = ?",
+            (password, backup_code, account_id),
+        )
+        await db.commit()
+    logger.info("Account %d credentials refreshed (email=%s)", account_id, redact_email(email))
+    return account_id
 
 
 async def get_account_by_id(account_id: int) -> dict | None:
@@ -646,3 +702,176 @@ async def mark_order_accounted(order_id: int) -> None:
             "UPDATE orders SET accounted = 1 WHERE id = ?", (order_id,)
         )
         await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# DSFUT orders
+#
+# Rows are written by dsfut.poller and consumed by a separate downstream
+# process. Status lifecycle: 'new' → 'claimed' (downstream) / 'deleted'
+# (manual review). Credentials live only in this table — never in logs.
+# ---------------------------------------------------------------------------
+
+
+async def insert_dsfut_order(
+    *,
+    transaction_id: int | None,
+    trade_id: str,
+    name: str,
+    rating: int | None,
+    position: str,
+    start_price: int | None,
+    buy_now_price: int | None,
+    amount: float | None,
+    net_price: float | None,
+    expires: int | None,
+    console: str,
+    account_email: str,
+    account_password: str,
+    account_backup_code: str,
+    raw_json: str,
+) -> int | None:
+    """
+    Store one popped order with status 'new'.
+    Returns the new row id, or None when this transaction_id already exists
+    (duplicate pop after a restart).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
+        cur = await db.execute(
+            """
+            INSERT OR IGNORE INTO dsfut_orders
+                (transaction_id, trade_id, name, rating, position,
+                 start_price, buy_now_price, amount, net_price, expires,
+                 console, account_email, account_password,
+                 account_backup_code, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (transaction_id, trade_id, name, rating, position,
+             start_price, buy_now_price, amount, net_price, expires,
+             console, account_email, account_password,
+             account_backup_code, raw_json),
+        )
+        await db.commit()
+        if cur.rowcount == 0:
+            return None
+        new_id = cur.lastrowid
+    logger.info(
+        "DSFUT order stored: id=%d transaction=%s player=%s account=%s",
+        new_id, transaction_id, name, redact_email(account_email),
+    )
+    return new_id
+
+
+async def insert_dsfut_stub_order(
+    *,
+    order_id: str | None,
+    platform: str,
+    coins: int | None,
+    amount: float | None,
+    raw_json: str,
+) -> int | None:
+    """
+    Record a picked-up order with only what the board row exposed (no
+    credentials yet — that is a later step). The full scraped row is kept in
+    raw_json so the follow-up detail step never depends on this column mapping.
+
+    Uses the site order id as transaction_id (when numeric) so a re-pick of the
+    same order is ignored rather than duplicated. Returns the new row id, or
+    None if it was already stored.
+    """
+    tx_id = int(order_id) if order_id is not None and str(order_id).isdigit() else None
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
+        cur = await db.execute(
+            """
+            INSERT OR IGNORE INTO dsfut_orders
+                (transaction_id, trade_id, buy_now_price, net_price,
+                 console, status, raw_json)
+            VALUES (?, ?, ?, ?, ?, 'new', ?)
+            """,
+            (tx_id, str(order_id) if order_id is not None else None,
+             coins, amount, platform, raw_json),
+        )
+        await db.commit()
+        if cur.rowcount == 0:
+            return None
+        new_id = cur.lastrowid
+    logger.info(
+        "DSFUT stub order stored: id=%d order=%s platform=%s coins=%s",
+        new_id, order_id, platform, coins,
+    )
+    return new_id
+
+
+async def link_dsfut_order_account(order_id: int, ea_account_id: int) -> None:
+    """Point a stored DSFUT order at the ea_accounts row created for it."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
+        await db.execute(
+            "UPDATE dsfut_orders SET ea_account_id = ? WHERE id = ?",
+            (ea_account_id, order_id),
+        )
+        await db.commit()
+
+
+async def claim_next_dsfut_order() -> dict | None:
+    """
+    Atomically claim the oldest 'new' DSFUT order: status 'new' → 'claimed'
+    and the full row is returned. Executed as a single UPDATE … RETURNING
+    statement, so two concurrent consumers can never grab the same row
+    (SQLite allows one writer at a time; WAL + busy_timeout make the loser
+    wait instead of erroring). Returns None when nothing is pending.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA busy_timeout=5000")
+        async with db.execute(
+            """
+            UPDATE dsfut_orders
+               SET status = 'claimed'
+             WHERE id = (SELECT id FROM dsfut_orders
+                          WHERE status = 'new'
+                          ORDER BY created_at ASC, id ASC
+                          LIMIT 1)
+            RETURNING *
+            """
+        ) as cur:
+            row = await cur.fetchone()
+        await db.commit()
+    return dict(row) if row else None
+
+
+async def mark_dsfut_order_deleted(order_id: int) -> bool:
+    """Manual review: never let a consumer touch this row again."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
+        cur = await db.execute(
+            "UPDATE dsfut_orders SET status = 'deleted' WHERE id = ?",
+            (order_id,),
+        )
+        await db.commit()
+    return cur.rowcount > 0
+
+
+async def list_dsfut_orders(
+    include_deleted: bool = False, limit: int = 100
+) -> list[dict]:
+    """Recent DSFUT orders, newest first. 'deleted' rows hidden by default."""
+    where = "" if include_deleted else "WHERE status != 'deleted'"
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            f"""
+            SELECT id, transaction_id, trade_id, name, rating, position,
+                   start_price, buy_now_price, amount, net_price, expires,
+                   console, account_email, ea_account_id, status, created_at
+              FROM dsfut_orders
+              {where}
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?
+            """,
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]

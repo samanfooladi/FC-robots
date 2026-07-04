@@ -37,7 +37,7 @@ from db.database import (
 from market.buyer import buy_card, search_card
 from market.lister import list_card, move_to_tradepile
 from market.player_names import get_player_name, get_player_position
-from bot.notifications import send_card_listed, send_order_complete, safe_send
+from bot.notifications import send_order_complete, safe_send
 from browser_pool.pool import BrowserPool
 from utils.delays import human_delay
 
@@ -554,28 +554,6 @@ class OrderWorker:
                 cards_listed,
                 quantity,
             )
-            # Tell the ordering admin right away — the final summary only goes
-            # out once the whole order is done, which can take a while.
-            try:
-                if card_config["ordered_by"]:
-                    await send_card_listed(
-                        bot=self.bot,
-                        client_telegram_id=card_config["ordered_by"],
-                        player_name=held["player_name"],
-                        # lister floors the bid to a 100-coin tier; show the
-                        # same value the auction actually uses
-                        start_bid=(start_bid // 100) * 100,
-                        buy_now=list_price,
-                        cards_done=cards_listed,
-                        total=quantity,
-                    )
-            except Exception:
-                logger.warning(
-                    "Order #%d: could not send card-listed message",
-                    order_id,
-                    exc_info=True,
-                )
-
             held = None  # card delivered — clear so the next loop buys a new one
 
             # ── INTER-CYCLE DELAY ─────────────────────────────────────────────

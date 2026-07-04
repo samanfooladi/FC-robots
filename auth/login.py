@@ -26,6 +26,7 @@ a live "use a backup code instead" screen yet.
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -174,11 +175,22 @@ async def _submit_2fa_code(page: Page) -> None:
     await page.wait_for_load_state("networkidle", timeout=15_000)
 
 
+def _split_backup_codes(backup_code: str) -> list[str]:
+    """
+    The stored value may hold several single-use codes (DSFUT console orders
+    always come with two — if the first is already spent, the second works).
+    Accepts comma / space / semicolon / slash separated input.
+    """
+    return [c for c in re.split(r"[,\s;/|]+", backup_code) if c]
+
+
 async def _handle_2fa_backup_code(page: Page, backup_code: str) -> None:
     """
     UNVERIFIED best-effort flow:
       1. "Verify your identity" page -> switch to the backup-code option
-      2. Backup-code entry page      -> fill code, submit
+      2. Backup-code entry page      -> fill code, submit; if the input is
+         still there after submitting (code rejected/spent), try the next
+         stored code.
     Backup codes are single-use, so this should only ever be called once per
     account (during first_login). Returns silently if no 2FA prompt appears.
     """
@@ -206,12 +218,30 @@ async def _handle_2fa_backup_code(page: Page, backup_code: str) -> None:
         logger.warning("No backup-code input found — 2FA flow may have changed")
         return
 
-    logger.info("Entering backup code…")
-    await page.fill(code_selector, backup_code)
-    await asyncio.sleep(0.3)
+    codes = _split_backup_codes(backup_code)
+    for idx, code in enumerate(codes, start=1):
+        logger.info("Entering backup code %d/%d…", idx, len(codes))
+        await page.fill(code_selector, code)
+        await asyncio.sleep(0.3)
 
-    await _check_remember_device(page)
-    await _submit_2fa_code(page)
+        await _check_remember_device(page)
+        await _submit_2fa_code(page)
+
+        # Input gone (hidden/detached) → the code was accepted and the flow
+        # moved on. Still visible → code rejected; try the next one.
+        try:
+            await page.wait_for_selector(code_selector, state="hidden", timeout=8_000)
+            logger.info("Backup code %d/%d accepted", idx, len(codes))
+            return
+        except PWTimeout:
+            if idx < len(codes):
+                logger.warning("Backup code %d/%d seems rejected — trying the next one", idx, len(codes))
+                try:
+                    await page.fill(code_selector, "")
+                except Exception:
+                    pass
+            else:
+                logger.warning("All %d backup code(s) submitted — page did not move on", len(codes))
 
 
 async def _capture_ut_session(

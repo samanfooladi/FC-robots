@@ -1,5 +1,6 @@
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from config import LOG_LEVEL
@@ -17,7 +18,12 @@ def setup_logging(level: int | None = None) -> None:
 
     handlers: list[logging.Handler] = [
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(_LOG_DIR / "fc_bot.log", encoding="utf-8"),
+        RotatingFileHandler(
+            _LOG_DIR / "fc_bot.log",
+            maxBytes=5_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        ),
     ]
 
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
