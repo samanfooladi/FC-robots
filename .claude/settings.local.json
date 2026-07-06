@@ -8,7 +8,15 @@
       "Bash(python -)",
       "Bash(python -m py_compile dsfut_browser/__init__.py dsfut_browser/board.py dsfut_browser/session.py dsfut_browser/poller.py dsfut_browser/__main__.py db/database.py config.py main.py)",
       "Bash(python -c \"import config; print\\('config imports OK; DSFUT_ENABLED=', config.DSFUT_ENABLED, 'profile=', config.DSFUT_BROWSER_PROFILE_DIR, 'interval=', config.DSFUT_POLL_INTERVAL_S\\)\")",
-      "Bash(DB_PATH=\"C:/Users/saman/AppData/Local/Temp/claude/F--My-Projects-dooste-koni/f4174535-e3d3-4a2c-869b-24c140b88f91/scratchpad/race_test.db\" python -)"
+      "Bash(DB_PATH=\"C:/Users/saman/AppData/Local/Temp/claude/F--My-Projects-dooste-koni/f4174535-e3d3-4a2c-869b-24c140b88f91/scratchpad/race_test.db\" python -)",
+      "Bash(python -m py_compile dsfut_browser/*.py config.py main.py)",
+      "Bash(DB_PATH=\"C:/Users/saman/AppData/Local/Temp/claude/F--My-Projects-dooste-koni/f4174535-e3d3-4a2c-869b-24c140b88f91/scratchpad/comf_test.db\" python -)",
+      "Bash(python -m py_compile dsfut_browser/*.py config.py main.py db/database.py bot/notifications.py)",
+      "Bash(DB_PATH=\"C:/Users/saman/AppData/Local/Temp/claude/F--My-Projects-dooste-koni/f4174535-e3d3-4a2c-869b-24c140b88f91/scratchpad/leak_dbg.db\" python -)",
+      "Bash(python -m py_compile utils/logger.py)",
+      "Bash(PYTHONIOENCODING=\"\" DB_PATH=\"C:/Users/saman/AppData/Local/Temp/claude/F--My-Projects-dooste-koni/f4174535-e3d3-4a2c-869b-24c140b88f91/scratchpad/emoji_dbg.db\" python -)",
+      "Bash(python -m py_compile dsfut_browser/*.py)",
+      "Bash(python -m py_compile dsfut_browser/http_client.py dsfut_browser/poller.py)"
     ]
   }
 }

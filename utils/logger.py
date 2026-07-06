@@ -16,6 +16,14 @@ def setup_logging(level: int | None = None) -> None:
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
+    # Make the console tolerant of characters outside its native code page
+    # (emoji in log lines, accented player names) so Unicode never raises inside
+    # logging on a Windows cp1252 console. The file handler is already UTF-8.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass
+
     handlers: list[logging.Handler] = [
         logging.StreamHandler(sys.stdout),
         RotatingFileHandler(
@@ -28,6 +36,10 @@ def setup_logging(level: int | None = None) -> None:
 
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
 
-    # Silence noisy third-party loggers
-    for name in ("httpx", "httpcore", "playwright", "asyncio"):
+    # Silence noisy third-party loggers.
+    # aiosqlite is security-critical, not just noise: at DEBUG it logs every SQL
+    # statement WITH its bound parameters — which for dsfut_orders/ea_accounts
+    # includes account email/password/backup codes. Pin it to WARNING so those
+    # never reach stdout or the log file even when LOG_LEVEL=DEBUG.
+    for name in ("httpx", "httpcore", "playwright", "asyncio", "aiosqlite"):
         logging.getLogger(name).setLevel(logging.WARNING)

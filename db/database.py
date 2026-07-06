@@ -763,47 +763,6 @@ async def insert_dsfut_order(
     return new_id
 
 
-async def insert_dsfut_stub_order(
-    *,
-    order_id: str | None,
-    platform: str,
-    coins: int | None,
-    amount: float | None,
-    raw_json: str,
-) -> int | None:
-    """
-    Record a picked-up order with only what the board row exposed (no
-    credentials yet — that is a later step). The full scraped row is kept in
-    raw_json so the follow-up detail step never depends on this column mapping.
-
-    Uses the site order id as transaction_id (when numeric) so a re-pick of the
-    same order is ignored rather than duplicated. Returns the new row id, or
-    None if it was already stored.
-    """
-    tx_id = int(order_id) if order_id is not None and str(order_id).isdigit() else None
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA busy_timeout=5000")
-        cur = await db.execute(
-            """
-            INSERT OR IGNORE INTO dsfut_orders
-                (transaction_id, trade_id, buy_now_price, net_price,
-                 console, status, raw_json)
-            VALUES (?, ?, ?, ?, ?, 'new', ?)
-            """,
-            (tx_id, str(order_id) if order_id is not None else None,
-             coins, amount, platform, raw_json),
-        )
-        await db.commit()
-        if cur.rowcount == 0:
-            return None
-        new_id = cur.lastrowid
-    logger.info(
-        "DSFUT stub order stored: id=%d order=%s platform=%s coins=%s",
-        new_id, order_id, platform, coins,
-    )
-    return new_id
-
-
 async def link_dsfut_order_account(order_id: int, ea_account_id: int) -> None:
     """Point a stored DSFUT order at the ea_accounts row created for it."""
     async with aiosqlite.connect(DB_PATH) as db:

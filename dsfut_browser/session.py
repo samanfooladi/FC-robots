@@ -4,8 +4,8 @@ Persistent Chromium session for dsfut.net.
 The login page has a manually-solved captcha we deliberately do NOT automate.
 Instead we keep a persistent context on disk so a human solves the captcha
 once and the session survives restarts. Login state is inferred from the
-homepage: a logged-out visit redirects to the login page / shows a password
-field; a logged-in visit shows the order board.
+comfort-trade board page: a logged-out visit redirects to the login page /
+shows a password field; a logged-in visit shows the order board.
 """
 
 import asyncio
@@ -32,10 +32,10 @@ _LOGIN_URL_HINTS = ("/login", "/signin", "/sign-in", "/auth", "/register")
 
 
 class DsfutBrowserSession:
-    def __init__(self, profile_dir, headless: bool, home_url: str) -> None:
+    def __init__(self, profile_dir, headless: bool, board_url: str) -> None:
         self.profile_dir = str(profile_dir)
         self.headless = headless
-        self.home_url = home_url
+        self.board_url = board_url
         self._pw: Playwright | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
@@ -74,13 +74,22 @@ class DsfutBrowserSession:
         self.page = None
         self._pw = None
 
+    async def export_cookies(self) -> list[dict]:
+        """
+        Return the authenticated context's cookies (dsfutnet_session, XSRF-TOKEN,
+        etc.) so the fast HTTP loop can reuse the same session. Must be called
+        while the context is still open (i.e. right after ensure_logged_in()).
+        """
+        assert self.context is not None
+        return await self.context.cookies()
+
     # ------------------------------------------------------------------
     # Navigation & auth state
     # ------------------------------------------------------------------
 
-    async def goto_home(self) -> None:
+    async def goto_board(self) -> None:
         assert self.page is not None
-        await self.page.goto(self.home_url, wait_until="domcontentloaded", timeout=30_000)
+        await self.page.goto(self.board_url, wait_until="domcontentloaded", timeout=30_000)
 
     def url_is_login(self, url: str | None) -> bool:
         low = (url or "").lower()
@@ -90,7 +99,7 @@ class DsfutBrowserSession:
         """
         Heuristic: we are logged out if the current URL looks like a login page,
         or the page is showing a password field. Called only when already on
-        (or having just navigated to) the homepage.
+        (or having just navigated to) the board page.
         """
         assert self.page is not None
         if self.url_is_login(self.page.url):
@@ -102,11 +111,11 @@ class DsfutBrowserSession:
 
     async def ensure_logged_in(self, *, interactive: bool = True) -> bool:
         """
-        Navigate to the homepage and confirm we are authenticated. If not and
+        Navigate to the board page and confirm we are authenticated. If not and
         *interactive*, ask the human to solve the captcha in the visible window
         and press Enter, then re-check once. Returns True only when logged in.
         """
-        await self.goto_home()
+        await self.goto_board()
         if not await self.is_logged_out():
             logger.info("DSFUT: existing session is authenticated")
             return True
@@ -117,7 +126,7 @@ class DsfutBrowserSession:
 
         await self._wait_for_manual_login()
 
-        await self.goto_home()
+        await self.goto_board()
         if await self.is_logged_out():
             logger.error("DSFUT: still not logged in after manual step")
             return False
@@ -147,6 +156,6 @@ class DsfutBrowserSession:
             logger.warning("DSFUT: no interactive console — waiting for login by polling")
             for _ in range(120):  # up to ~10 min
                 await asyncio.sleep(5)
-                await self.goto_home()
+                await self.goto_board()
                 if not await self.is_logged_out():
                     return
