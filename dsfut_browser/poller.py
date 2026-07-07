@@ -35,6 +35,7 @@ from config import (
     DSFUT_BROWSER_HEADLESS,
     DSFUT_BROWSER_PROFILE_DIR,
     DSFUT_HTTP_TIMEOUT_S,
+    DSFUT_MAX_ACTIVE_COINS,
     DSFUT_POLL_INTERVAL_S,
 )
 from db.database import (
@@ -48,15 +49,23 @@ from utils.redact import redact_email
 from .http_client import DsfutHttpClient, SessionExpired
 from .parser import (
     eligible_orders,
+    extract_danger_alerts,
     order_already_taken,
+    order_over_limit,
     parse_active_order,
     redact_html_for_debug,
+    sum_active_coins,
 )
 from .session import _USER_AGENT, DsfutBrowserSession
 
 logger = logging.getLogger(__name__)
 
 _MAX_BACKOFF_S = 30.0
+# How long the active-coins total (used for the DSFUT_MAX_ACTIVE_COINS filter)
+# may be reused before re-reading /comfortable/active. Completing an order is a
+# manual step on the site, so a minute of staleness only delays when a skipped
+# order becomes attemptable again.
+_ACTIVE_REFRESH_S = 60.0
 # Credential VALUES are redacted before saving (see parser.redact_html_for_debug)
 # — only the markup structure is kept, to diagnose parser misses against the
 # real page without persisting real account credentials outside the DB.
@@ -80,6 +89,14 @@ class DsfutBrowserPoller:
         # Orders already claimed/lost this run — avoids re-attempting a pickup
         # every poll while the same id lingers on the board.
         self._handled: set[str] = set()
+        # Coins tied up in our active orders, for the DSFUT_MAX_ACTIVE_COINS
+        # filter. Refreshed from /comfortable/active at most every
+        # _ACTIVE_REFRESH_S; bumped immediately on a successful pickup.
+        self._active_coins = 0
+        self._active_coins_at = 0.0  # monotonic time of last refresh; 0 = stale
+        # Orders skipped over the cap, so the skip is logged once per order,
+        # not every poll. NOT _handled: they are retried when capacity frees up.
+        self._cap_logged: set[str] = set()
 
     # ------------------------------------------------------------------
     # Entry point
@@ -135,6 +152,7 @@ class DsfutBrowserPoller:
         backoff = 1.0
         while True:
             try:
+                await self._maybe_refresh_active_coins()
                 data = await self.http.poll_comfortables()
                 orders = eligible_orders(data)
                 if orders:
@@ -160,10 +178,51 @@ class DsfutBrowserPoller:
                 logger.exception("DSFUT: unexpected fast-loop error — continuing")
                 await asyncio.sleep(1.0)
 
+    async def _maybe_refresh_active_coins(self) -> None:
+        """Re-read the coins tied up in our active orders when the total is stale."""
+        if DSFUT_MAX_ACTIVE_COINS <= 0:
+            return
+        now = time.monotonic()
+        if self._active_coins_at and now - self._active_coins_at < _ACTIVE_REFRESH_S:
+            return
+        total = sum_active_coins(await self.http.get_active())
+        if total != self._active_coins:
+            logger.info(
+                "DSFUT: active orders now hold %s coins (was %s) — %s of the %s cap free",
+                f"{total:,}", f"{self._active_coins:,}",
+                f"{max(DSFUT_MAX_ACTIVE_COINS - total, 0):,}",
+                f"{DSFUT_MAX_ACTIVE_COINS:,}",
+            )
+        self._active_coins = total
+        self._active_coins_at = now
+
+    def _over_cap(self, order: dict, oid: str) -> bool:
+        """True when picking up *order* would push us past DSFUT_MAX_ACTIVE_COINS."""
+        if DSFUT_MAX_ACTIVE_COINS <= 0:
+            return False
+        coins = order.get("coins")
+        if not isinstance(coins, (int, float)) or coins <= 0:
+            return False  # size unknown — attempt it and let the server decide
+        if self._active_coins + coins <= DSFUT_MAX_ACTIVE_COINS:
+            self._cap_logged.discard(oid)
+            return False
+        if oid not in self._cap_logged:
+            self._cap_logged.add(oid)
+            logger.info(
+                "DSFUT: order %s (%s coins) skipped — %s coins already active, "
+                "cap is %s; will retry while it stays on the board if capacity "
+                "frees up",
+                oid, f"{int(coins):,}", f"{self._active_coins:,}",
+                f"{DSFUT_MAX_ACTIVE_COINS:,}",
+            )
+        return True
+
     async def _handle_batch(self, orders: list[dict]) -> None:
         for order in orders:
             oid = str(order.get("id"))
             if oid in self._handled:
+                continue
+            if self._over_cap(order, oid):
                 continue
             # Timestamp the moment this order was first seen eligible, right
             # after poll_comfortables() returned — the baseline for race timing.
@@ -201,15 +260,40 @@ class DsfutBrowserPoller:
 
         details = parse_active_order(html, oid)
 
-        # (c) No matching <fc-comfortable> AND no "already taken" banner — the
-        # active page has no order for us at all (e.g. "There is no information
-        # to display"). Despite the 302, our pickup most likely never claimed
-        # anything server-side (someone beat us to it, or it didn't take effect).
-        # Nothing to check manually, so NO admin alert — just log distinctly and
-        # keep a redacted dump so a high rate of this points at the pickup
-        # endpoint rather than the parser.
+        # (c) No matching <fc-comfortable> AND no "already taken" banner. The
+        # pickup 302s the same way on success and failure — the reason only
+        # travels as a flash alert on the active page, so read it out.
         if details is None:
             self._handled.add(oid)
+            alerts = extract_danger_alerts(html)
+
+            # Rejected because the order would push the account past its DSFUT
+            # cap (coins of still-active orders count toward it). Actionable —
+            # completing the active orders frees capacity — so tell the admins.
+            if order_over_limit(alerts):
+                logger.warning(
+                    "DSFUT: pickup(%s) rejected by DSFUT: %r — order size plus "
+                    "our active orders exceeds the account's allowed amount "
+                    "(set DSFUT_MAX_ACTIVE_COINS to skip these without a request)",
+                    oid, " | ".join(alerts),
+                )
+                await self._alert_over_limit(order)
+                self._active_coins_at = 0.0  # estimate was off — force a re-read
+                return False
+
+            if alerts:
+                logger.info(
+                    "DSFUT: pickup(%s) returned 302 but was rejected with an "
+                    "alert on /comfortable/active: %r",
+                    oid, " | ".join(alerts),
+                )
+                return False
+
+            # No alert at all and no order for us — despite the 302, the pickup
+            # most likely never claimed anything server-side (someone beat us to
+            # it, or it didn't take effect). Nothing to check manually, so NO
+            # admin alert — keep a redacted dump so a high rate of this points
+            # at the pickup endpoint rather than the parser.
             dump_path = self._save_debug_html(oid, html, suffix="_notclaimed")
             logger.info(
                 "DSFUT: pickup(%s) returned 302 but /comfortable/active shows no "
@@ -236,6 +320,9 @@ class DsfutBrowserPoller:
 
         # (b) Success.
         self._handled.add(oid)
+        coins = order.get("coins") or details.get("coins") or 0
+        if isinstance(coins, (int, float)):
+            self._active_coins += int(coins)
         await self._store_and_notify(order, details)
         return True
 
@@ -248,6 +335,23 @@ class DsfutBrowserPoller:
         except Exception:
             logger.debug("DSFUT: failed to save debug HTML for order %s", oid, exc_info=True)
             return "(save failed)"
+
+    async def _alert_over_limit(self, order: dict) -> None:
+        oid = order.get("id")
+        coins = order.get("coins")
+        coins_s = f"{coins:,}" if isinstance(coins, (int, float)) else str(coins)
+        cap_s = (
+            f"{DSFUT_MAX_ACTIVE_COINS:,} (DSFUT_MAX_ACTIVE_COINS)"
+            if DSFUT_MAX_ACTIVE_COINS > 0
+            else "unknown — set DSFUT_MAX_ACTIVE_COINS so the bot skips these"
+        )
+        await self._alert(
+            f"⚠️ DSFUT rejected pickup of order {oid} ({coins_s} coins): "
+            f"\"The amount exceeds the maximum allowed.\"\n"
+            f"The cap counts coins of orders still ACTIVE on the account — "
+            f"completing them frees capacity.\n"
+            f"Configured cap: {cap_s}"
+        )
 
     async def _alert_unparsed(self, order: dict) -> None:
         oid = order.get("id")

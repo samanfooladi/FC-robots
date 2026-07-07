@@ -62,6 +62,46 @@ def order_already_taken(html_text: str) -> bool:
     return _TAKEN_MARKER in (html_text or "").lower()
 
 
+# The pickup 302 is the same on success and failure — the failure reason only
+# travels as a flash message (<div class="uk-alert uk-alert-danger">…</div>) on
+# the page it redirects to. Flat text only; a nested <div> inside the alert
+# would truncate the match, which hasn't been observed.
+_DANGER_ALERT_RE = re.compile(
+    r'<div[^>]*class="[^"]*uk-alert-danger[^"]*"[^>]*>(.*?)</div>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def extract_danger_alerts(html_text: str) -> list[str]:
+    """Plain-text contents of every danger alert on the page."""
+    out = []
+    for m in _DANGER_ALERT_RE.finditer(html_text or ""):
+        text = re.sub(r"<[^>]+>", " ", m.group(1))
+        text = _html.unescape(re.sub(r"\s+", " ", text)).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def order_over_limit(alerts: list[str]) -> bool:
+    """
+    True when a pickup was rejected because the order would push the account
+    past its DSFUT cap ("The amount exceeds the maximum allowed."). The cap is
+    cumulative: coins of orders still active count against it.
+    """
+    return any("amount exceeds the maximum" in a.lower() for a in alerts)
+
+
+def sum_active_coins(html_text: str) -> int:
+    """Total coins across every <fc-comfortable> block on the active page."""
+    total = 0
+    for m in _FC_TAG_RE.finditer(html_text or ""):
+        coins = _to_int(_tag_attrs(m.group(1)).get("coins", ""))
+        if coins:
+            total += coins
+    return total
+
+
 def looks_like_login(text: str) -> bool:
     """Heuristic that a response is actually a login page (session expired)."""
     low = (text or "").lower()

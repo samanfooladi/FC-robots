@@ -46,3 +46,10 @@ DSFUT_BROWSER_HEADLESS: bool = os.getenv("DSFUT_BROWSER_HEADLESS", "false").stri
 # the per-request HTTP timeout.
 DSFUT_POLL_INTERVAL_S: float = float(os.getenv("DSFUT_POLL_INTERVAL_S", "0.1"))
 DSFUT_HTTP_TIMEOUT_S: float = float(os.getenv("DSFUT_HTTP_TIMEOUT_S", "15"))
+# DSFUT rejects a pickup with "The amount exceeds the maximum allowed" when the
+# order's coins plus the coins of orders still ACTIVE on the account go over
+# the account's cap (observed: 1.8M alone OK, 2M on top of an active 1.8M
+# rejected, 4.9M alone rejected — ask the DSFUT manager for the exact number).
+# Set the cap here so oversized orders are skipped instead of burning a doomed
+# pickup request. 0 = don't pre-filter; the server still enforces its limit.
+DSFUT_MAX_ACTIVE_COINS: int = int(os.getenv("DSFUT_MAX_ACTIVE_COINS", "0"))

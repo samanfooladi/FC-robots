@@ -16,7 +16,18 @@
       "Bash(python -m py_compile utils/logger.py)",
       "Bash(PYTHONIOENCODING=\"\" DB_PATH=\"C:/Users/saman/AppData/Local/Temp/claude/F--My-Projects-dooste-koni/f4174535-e3d3-4a2c-869b-24c140b88f91/scratchpad/emoji_dbg.db\" python -)",
       "Bash(python -m py_compile dsfut_browser/*.py)",
-      "Bash(python -m py_compile dsfut_browser/http_client.py dsfut_browser/poller.py)"
+      "Bash(python -m py_compile dsfut_browser/http_client.py dsfut_browser/poller.py)",
+      "Bash(python -m py_compile dsfut_browser/poller.py dsfut_browser/http_client.py config.py)",
+      "Bash(python -c \"import config; print\\('DSFUT_POLL_INTERVAL_S =', config.DSFUT_POLL_INTERVAL_S\\)\")",
+      "Bash(git --no-pager diff -- config.py dsfut_browser/http_client.py dsfut_browser/poller.py)",
+      "Bash(git --no-pager log --oneline -8 -- dsfut_browser/http_client.py dsfut_browser/poller.py config.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('dsfut_browser/http_client.py', encoding='utf-8'\\).read\\(\\)\\); print\\('http_client.py: OK'\\)\")",
+      "Bash(py -c \"import ast; ast.parse\\(open\\('dsfut_browser/http_client.py', encoding='utf-8'\\).read\\(\\)\\); print\\('http_client.py: OK'\\)\")",
+      "Bash(git --no-pager diff -- .env.example)",
+      "Bash(git --no-pager diff -- .claude/settings.local.json)",
+      "Bash(gh auth *)",
+      "Bash(git fetch *)",
+      "Bash(git rev-list *)"
     ]
   }
 }
