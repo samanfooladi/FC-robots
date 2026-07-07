@@ -44,5 +44,5 @@ DSFUT_BROWSER_HEADLESS: bool = os.getenv("DSFUT_BROWSER_HEADLESS", "false").stri
 # Fast HTTP loop: how often to poll /api/json/comfortables (the site's own
 # frontend polls every few seconds; we go faster for a competitive edge) and
 # the per-request HTTP timeout.
-DSFUT_POLL_INTERVAL_S: float = float(os.getenv("DSFUT_POLL_INTERVAL_S", "0.4"))
+DSFUT_POLL_INTERVAL_S: float = float(os.getenv("DSFUT_POLL_INTERVAL_S", "0.1"))
 DSFUT_HTTP_TIMEOUT_S: float = float(os.getenv("DSFUT_HTTP_TIMEOUT_S", "15"))

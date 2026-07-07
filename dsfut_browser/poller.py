@@ -5,7 +5,7 @@ Startup / re-login uses the persistent Playwright context (manual captcha,
 handled in session.py). Once authenticated, the session cookies are handed to
 an httpx client and the hot loop is pure HTTP:
 
-  1. GET /api/json/comfortables            (poll, ~every 400 ms)
+  1. GET /api/json/comfortables            (poll, ~every 100 ms)
   2. filter PlayStation/Xbox orders, skip PC
   3. GET /comfortable/pickup/{id}/{hash}   (claim ASAP — races finish in seconds)
   4. GET /comfortable/active               (verify + read <fc-comfortable>)
@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -60,6 +61,11 @@ _MAX_BACKOFF_S = 30.0
 # — only the markup structure is kept, to diagnose parser misses against the
 # real page without persisting real account credentials outside the DB.
 _DEBUG_DIR = Path("data/dsfut_debug")
+
+
+def _ts_ms() -> str:
+    """Wall-clock timestamp with millisecond precision, for race-timing logs."""
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
 class DsfutBrowserPoller:
@@ -159,15 +165,24 @@ class DsfutBrowserPoller:
             oid = str(order.get("id"))
             if oid in self._handled:
                 continue
-            if await self._attempt(order):
+            # Timestamp the moment this order was first seen eligible, right
+            # after poll_comfortables() returned — the baseline for race timing.
+            detected_at = time.monotonic()
+            logger.info(
+                "DSFUT: order %s detected at %s (poll_comfortables returned an "
+                "eligible order)",
+                oid, _ts_ms(),
+            )
+            if await self._attempt(order, detected_at):
                 # One successful pickup per cycle; the next poll continues.
                 return
 
-    async def _attempt(self, order: dict) -> bool:
+    async def _attempt(self, order: dict, detected_at: float) -> bool:
         oid = str(order.get("id"))
         order_hash = order.get("hash")
 
-        redirected = await self.http.pickup(oid, order_hash)
+        logger.info("DSFUT: order %s — sending pickup request at %s", oid, _ts_ms())
+        redirected = await self.http.pickup(oid, order_hash, detected_at=detected_at)
         if not redirected:
             logger.info(
                 "DSFUT: pickup for order %s not confirmed (no redirect to "
