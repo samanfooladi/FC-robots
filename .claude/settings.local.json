@@ -27,7 +27,22 @@
       "Bash(git --no-pager diff -- .claude/settings.local.json)",
       "Bash(gh auth *)",
       "Bash(git fetch *)",
-      "Bash(git rev-list *)"
+      "Bash(git rev-list *)",
+      "PowerShell(python -c \"import dsfut_browser.poller as p; print\\('import OK'\\); print\\('cap filter present:', hasattr\\(p.DsfutBrowserPoller, '_over_cap'\\), hasattr\\(p.DsfutBrowserPoller, '_maybe_refresh_active_coins'\\), hasattr\\(p.DsfutBrowserPoller, '_alert_over_limit'\\)\\)\")",
+      "PowerShell(python -m py_compile bot\\\\router_admin.py bot\\\\keyboards.py db\\\\database.py browser_pool\\\\profiles.py)",
+      "PowerShell(if \\($?\\) { \"OK\" })",
+      "PowerShell(python -m py_compile bot\\\\router_admin.py bot\\\\keyboards.py browser_pool\\\\pool.py)",
+      "PowerShell(python -m py_compile auth\\\\login.py)",
+      "PowerShell(python -m py_compile bot\\\\router_admin.py bot\\\\keyboards.py browser_pool\\\\pool.py market\\\\tradepile.py)",
+      "PowerShell(python -m py_compile bot\\\\router_admin.py bot\\\\notifications.py bot\\\\keyboards.py db\\\\database.py order_queue\\\\worker.py)",
+      "PowerShell(if \\($?\\) { \"compile OK\" })",
+      "PowerShell(python \"C:\\\\Users\\\\saman\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--My-Projects-dooste-koni\\\\996df73d-8df0-4a75-83dc-0e85827d698e\\\\scratchpad\\\\test_msg.py\")",
+      "PowerShell($env:PYTHONIOENCODING = 'utf-8'; python \"C:\\\\Users\\\\saman\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--My-Projects-dooste-koni\\\\996df73d-8df0-4a75-83dc-0e85827d698e\\\\scratchpad\\\\test_msg.py\" | Out-File -Encoding utf8 \"C:\\\\Users\\\\saman\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--My-Projects-dooste-koni\\\\996df73d-8df0-4a75-83dc-0e85827d698e\\\\scratchpad\\\\out.txt\"; if \\($?\\) { \"done\" })",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python -c \"import sqlite3, time; from config import DB_PATH if False else None; import sys; sys.path.insert\\(0, r'F:\\\\My Projects\\\\dooste koni'\\); from config import DB_PATH; con = sqlite3.connect\\(DB_PATH\\); rows = con.execute\\('SELECT id, email, session_created_at, is_logged_in FROM ea_accounts'\\).fetchall\\(\\) if True else []; [print\\(r, 'age_h=', None if r[2] is None else round\\(\\(time.time\\(\\)-r[2]\\)/3600,1\\)\\) for r in rows]\")",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python \"C:\\\\Users\\\\saman\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--My-Projects-dooste-koni\\\\996df73d-8df0-4a75-83dc-0e85827d698e\\\\scratchpad\\\\check_session.py\")",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; Set-Location \"F:\\\\My Projects\\\\dooste koni\"; python \"C:\\\\Users\\\\saman\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--My-Projects-dooste-koni\\\\996df73d-8df0-4a75-83dc-0e85827d698e\\\\scratchpad\\\\check_session.py\")",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python -c \"import sqlite3,time; con=sqlite3.connect\\(r'F:\\\\My Projects\\\\dooste koni\\\\data\\\\fc_bot.db'\\); rows=con.execute\\('SELECT id,email,session_created_at FROM ea_accounts'\\).fetchall\\(\\); print\\([\\(r[0],r[1],None if r[2] is None else round\\(\\(time.time\\(\\)-r[2]\\)/3600,1\\)\\) for r in rows]\\)\"; if \\(Test-Path \"data\\\\fc_bot.db\"\\) { $pwd.Path })",
+      "PowerShell($env:PYTHONIOENCODING='utf-8'; python \"C:\\\\Users\\\\saman\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--My-Projects-dooste-koni\\\\996df73d-8df0-4a75-83dc-0e85827d698e\\\\scratchpad\\\\test_calc.py\" | Out-File -Encoding utf8 \"C:\\\\Users\\\\saman\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--My-Projects-dooste-koni\\\\996df73d-8df0-4a75-83dc-0e85827d698e\\\\scratchpad\\\\out3.txt\"; if \\($?\\) { \"done\" } ; python -m py_compile \"F:\\\\My Projects\\\\dooste koni\\\\order_queue\\\\worker.py\" \"F:\\\\My Projects\\\\dooste koni\\\\bot\\\\keyboards.py\"; if \\($?\\) { \"compile OK\" })"
     ]
   }
 }

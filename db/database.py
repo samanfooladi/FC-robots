@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS orders (
     status        TEXT    NOT NULL DEFAULT 'pending',
     accounted     INTEGER NOT NULL DEFAULT 0,
     ordered_by    INTEGER,
+    price_per_100k INTEGER,
     created_at    REAL    NOT NULL DEFAULT (unixepoch())
 );
 
@@ -68,6 +69,17 @@ CREATE TABLE IF NOT EXISTS transactions (
     listed_price    INTEGER NOT NULL,
     buynow_price    INTEGER NOT NULL,
     listed_at       REAL    NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS listed_cards (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id       INTEGER NOT NULL UNIQUE,
+    item_id        INTEGER NOT NULL,
+    order_id       INTEGER NOT NULL REFERENCES orders(id),
+    account_id     INTEGER NOT NULL REFERENCES ea_accounts(id),
+    bought_price   INTEGER NOT NULL DEFAULT 0,
+    price_per_100k INTEGER,
+    created_at     REAL    NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS dsfut_orders (
@@ -114,6 +126,7 @@ _MIGRATIONS = [
     "UPDATE cards SET buy_price_max = buy_price WHERE buy_price_max = 0 AND buy_price > 0",
     "ALTER TABLE transactions ADD COLUMN player_name TEXT",
     "ALTER TABLE transactions ADD COLUMN position TEXT",
+    "ALTER TABLE orders ADD COLUMN price_per_100k INTEGER",
 ]
 
 
@@ -373,6 +386,52 @@ async def disable_account(account_id: int) -> str:
     return "ok"
 
 
+async def delete_account_completely(account_id: int) -> dict | None:
+    """
+    Hard-delete an account and every trace of it stored in the bot:
+      - its orders and their transactions,
+      - the credential copies inside dsfut_orders rows (rows stay for
+        trade history but lose email/password/backup code/raw JSON),
+      - the ea_accounts row itself (credentials + saved session).
+    Returns the deleted account row (the caller still needs profile_path
+    to wipe the on-disk browser profile), or None when not found.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("PRAGMA busy_timeout=5000")
+        async with db.execute(
+            "SELECT * FROM ea_accounts WHERE id = ?", (account_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        account = dict(row)
+
+        await db.execute(
+            "DELETE FROM transactions WHERE order_id IN "
+            "(SELECT id FROM orders WHERE account_id = ?)",
+            (account_id,),
+        )
+        await db.execute("DELETE FROM orders WHERE account_id = ?", (account_id,))
+        await db.execute(
+            """
+            UPDATE dsfut_orders
+               SET account_email = NULL, account_password = NULL,
+                   account_backup_code = NULL, raw_json = NULL,
+                   ea_account_id = NULL
+             WHERE ea_account_id = ? OR account_email = ?
+            """,
+            (account_id, account["email"]),
+        )
+        await db.execute("DELETE FROM ea_accounts WHERE id = ?", (account_id,))
+        await db.commit()
+    logger.info(
+        "Account %d (%s) hard-deleted with all orders/transactions/credentials",
+        account_id, redact_email(account["email"]),
+    )
+    return account
+
+
 async def list_accounts_overview() -> list[dict]:
     """All accounts with login state — for the /accounts listing."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -475,10 +534,15 @@ async def create_order(
     account_id: int,
     ordered_by: int,
     order_amount: int,
+    price_per_100k: int | None = None,
 ) -> dict | None:
     """
     Create a pending order on *account_id*, placed by admin *ordered_by*
     (Telegram ID — receives the per-card and completion notifications).
+
+    *price_per_100k* is the admin's per-100k-coins purchase cost in Tomans,
+    entered manually with /order; NULL means "NotDefinedYet" (to be filled
+    in later).
 
     Derives quantity from the active card's list_price and max_cards.
     Returns the new order as a dict, or None on failure.
@@ -500,10 +564,11 @@ async def create_order(
         cur = await db.execute(
             """
             INSERT INTO orders
-                (account_id, card_id, quantity, order_amount, status, ordered_by)
-            VALUES (?, ?, ?, ?, 'pending', ?)
+                (account_id, card_id, quantity, order_amount, status,
+                 ordered_by, price_per_100k)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?)
             """,
-            (account_id, card["id"], quantity, order_amount, ordered_by),
+            (account_id, card["id"], quantity, order_amount, ordered_by, price_per_100k),
         )
         order_id = cur.lastrowid
         await db.commit()
@@ -588,6 +653,7 @@ async def get_order_with_card(order_id: int) -> dict | None:
                 o.order_amount,
                 o.status,
                 o.ordered_by,
+                o.price_per_100k,
                 cd.card_name,
                 cd.resource_id,
                 cd.min_rating,
@@ -655,6 +721,61 @@ async def count_transactions_for_order(order_id: int) -> int:
         ) as cur:
             row = await cur.fetchone()
     return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Listed cards — EA trade_id → order / supplier-rate linkage
+# ---------------------------------------------------------------------------
+
+
+async def save_listed_card(
+    *,
+    trade_id: int,
+    item_id: int,
+    order_id: int,
+    account_id: int,
+    bought_price: int,
+    price_per_100k: int | None,
+) -> None:
+    """
+    Persist one successfully listed card, keyed by the FINAL list_card
+    trade_id (the one that later appears as "tradeId" in the tradepile
+    response). *price_per_100k* is the admin's supplier rate for the order
+    (NULL = NotDefinedYet); *bought_price* is what this specific item was
+    bought for — the tradepile response itself never carries it.
+
+    A relist after a worker restart can hit the same trade_id, hence
+    INSERT OR REPLACE.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO listed_cards
+                (trade_id, item_id, order_id, account_id, bought_price, price_per_100k)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (trade_id, item_id, order_id, account_id, bought_price, price_per_100k),
+        )
+        await db.commit()
+
+
+async def get_listed_cards_by_trade_ids(trade_ids: list[int]) -> dict[int, dict]:
+    """
+    Bulk lookup for /checkcards and /calculate: {trade_id: row-dict} for every
+    trade_id that has a listed_cards record. Missing ids are simply absent.
+    """
+    trade_ids = [t for t in trade_ids if t]
+    if not trade_ids:
+        return {}
+    placeholders = ",".join("?" * len(trade_ids))
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            f"SELECT * FROM listed_cards WHERE trade_id IN ({placeholders})",
+            trade_ids,
+        ) as cur:
+            rows = await cur.fetchall()
+    return {r["trade_id"]: dict(r) for r in rows}
 
 
 # ---------------------------------------------------------------------------

@@ -31,15 +31,12 @@ def _build_headers(session: SessionData) -> dict[str, str]:
     return {**_COMMON_HEADERS, **session.ut_headers()}
 
 
-async def get_tradepile(session: SessionData) -> list[dict]:
+async def get_tradepile_response(session: SessionData) -> dict | None:
     """
-    Fetch all entries in the account's tradepile (listed + recently sold).
+    Fetch the full tradepile response ({"credits": …, "auctionInfo": […]}).
 
-    Returns the raw list of auction dicts from the EA response so the
-    accounting module can extract buyNowPrice, tradeState, etc. without
-    an extra abstraction layer.
-
-    Returns an empty list on failure or 401 (session.expired is set).
+    Returns None on failure or 401 (session.expired is set) so callers can
+    distinguish a genuinely empty tradepile from a failed fetch.
     """
     url = f"{_BASE}/tradepile"
 
@@ -58,19 +55,19 @@ async def get_tradepile(session: SessionData) -> list[dict]:
             if resp.status_code == 401:
                 session.expired = True
                 logger.warning("Session expired (401) during tradepile fetch — flagged for re-login")
-                return []
+                return None
 
             if resp.status_code in _RETRYABLE:
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(2 ** attempt)
                     continue
                 logger.error("get_tradepile: gave up after %d attempts (HTTP %d)", attempt, resp.status_code)
-                return []
+                return None
 
             resp.raise_for_status()
-            pile = resp.json().get("auctionInfo", [])
-            logger.info("get_tradepile: %d item(s) in tradepile", len(pile))
-            return pile
+            body = resp.json()
+            logger.info("get_tradepile: %d item(s) in tradepile", len(body.get("auctionInfo", [])))
+            return body
 
         except httpx.RequestError as exc:
             logger.warning("get_tradepile [attempt %d] network error: %s", attempt, exc)
@@ -78,6 +75,18 @@ async def get_tradepile(session: SessionData) -> list[dict]:
                 await asyncio.sleep(2 ** attempt)
             else:
                 logger.error("get_tradepile: all %d attempts failed", MAX_RETRIES)
-                return []
+                return None
 
-    return []
+    return None
+
+
+async def get_tradepile(session: SessionData) -> list[dict]:
+    """
+    Fetch all entries in the account's tradepile (listed + recently sold).
+
+    Returns the raw list of auction dicts from the EA response so callers
+    can extract buyNowPrice, tradeState, etc. without an extra abstraction
+    layer. Returns an empty list on failure or 401 (session.expired is set).
+    """
+    body = await get_tradepile_response(session)
+    return body.get("auctionInfo", []) if body else []

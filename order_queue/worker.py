@@ -31,6 +31,7 @@ from db.database import (
     count_transactions_for_order,
     get_order_with_card,
     get_transactions_for_order,
+    save_listed_card,
     save_transaction,
     update_order_status,
 )
@@ -218,6 +219,7 @@ class OrderWorker:
                 order_id=order_id,
                 order_amount=order["order_amount"],
                 transactions=transactions,
+                price_per_100k=order.get("price_per_100k"),
             )
         except Exception:
             logger.exception(
@@ -544,6 +546,23 @@ class OrderWorker:
                 buynow_price=list_price,
                 position=held.get("position"),
             )
+            # Link the FINAL tradepile trade_id to this order's supplier rate
+            # (price_per_100k) so /checkcards and /calculate can compute C once
+            # the card sells. Metadata only — never let it kill the order loop.
+            try:
+                await save_listed_card(
+                    trade_id=int(list_result.trade_id),
+                    item_id=item_id,
+                    order_id=order_id,
+                    account_id=self.account_id,
+                    bought_price=held["price_paid"],
+                    price_per_100k=card_config.get("price_per_100k"),
+                )
+            except Exception:
+                logger.exception(
+                    "Order #%d: could not save listed_cards record for trade=%s",
+                    order_id, list_result.trade_id,
+                )
             cards_listed += 1
             logger.info(
                 "Order #%d: listed item=%d trade=%s at %d  (%d/%d)",
