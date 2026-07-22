@@ -207,6 +207,95 @@ class BrowserPool:
     def is_pooled(self, account_id: int) -> bool:
         return account_id in self._entries
 
+    # Coin balance in the UT web-app header — best-effort selectors; the
+    # screenshot is taken regardless once the wait resolves or times out.
+    _COIN_HEADER_SELECTORS = (
+        ".view-navbar-currency-coins, .ut-currency-value, .coins-value"
+    )
+
+    async def screenshot_account(self, account_id: int) -> bytes | None:
+        """
+        Viewport PNG of the account's live page (proof-of-balance evidence).
+        Reuses the existing page — no navigation, no clicks, no new context.
+        Returns None when the account has no live browser or capture fails.
+        """
+        entry = self._entries.get(account_id)
+        if entry is None:
+            return None
+        async with entry.lock:
+            try:
+                try:
+                    await entry.page.wait_for_selector(
+                        self._COIN_HEADER_SELECTORS, state="visible", timeout=5_000
+                    )
+                except Exception:
+                    logger.debug(
+                        "Account %d: coin header not found before screenshot — capturing anyway",
+                        account_id,
+                    )
+                return await entry.page.screenshot(type="png")
+            except Exception:
+                logger.exception("Account %d: screenshot failed", account_id)
+                return None
+
+    # Transfer List action buttons ("Clear Sold" / "Re-list All") share this
+    # class; they are disambiguated by their visible text.
+    _TRADEPILE_BTN_SELECTOR = ".btn-standard.section-header-btn.mini.primary"
+
+    async def click_tradepile_button(
+        self, account_id: int, label: str
+    ) -> tuple[bool, str]:
+        """
+        Click a Transfer List action button ("Clear Sold" / "Re-list All")
+        on the account's live web-app page. If the page is not currently on
+        the Transfer List screen, a best-effort SPA navigation is attempted
+        first (Transfers tab → Transfer List tile).
+        Returns (ok, error_detail).
+        """
+        entry = self._entries.get(account_id)
+        if entry is None:
+            return False, "no live browser session"
+
+        async with entry.lock:
+            page = entry.page
+            try:
+                button = page.locator(
+                    self._TRADEPILE_BTN_SELECTOR, has_text=label
+                ).first
+                if not await button.count():
+                    logger.info(
+                        "Account %d: '%s' button not on screen — navigating to Transfer List…",
+                        account_id, label,
+                    )
+                    await self._goto_transfer_list(page)
+                await button.wait_for(state="visible", timeout=10_000)
+                await button.click()
+                # Give the SPA a moment to fire its request and update state.
+                await asyncio.sleep(2.0)
+                logger.info("Account %d: '%s' clicked on Transfer List", account_id, label)
+                return True, ""
+            except Exception as exc:
+                logger.exception("Account %d: clicking '%s' failed", account_id, label)
+                return False, str(exc)
+
+    async def _goto_transfer_list(self, page: Page) -> None:
+        """
+        Best-effort SPA navigation to the Transfer List screen. The nav
+        selectors are the web app's standard ones but are not guaranteed —
+        the caller's wait on the action button reports failure clearly.
+        """
+        try:
+            await page.click(".ut-tab-bar-item.icon-transfer", timeout=5_000)
+            await page.click(".ut-tile-transfer-list", timeout=5_000)
+            await page.wait_for_selector(
+                self._TRADEPILE_BTN_SELECTOR, timeout=10_000
+            )
+        except Exception:
+            logger.warning(
+                "Transfer List navigation did not reach the action buttons — "
+                "the page may already be elsewhere or nav selectors changed"
+            )
+
     async def _close_entry(self, account_id: int) -> None:
         entry = self._entries.pop(account_id, None)
         if entry is None:

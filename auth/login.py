@@ -19,9 +19,10 @@ restore_session()
     in which case the caller should fall back to a password-only re-login.
 
 NOTE: EA occasionally changes login-page selectors; update the constants at
-the top of this file if the flow breaks. The backup-code selectors in
-particular are best-effort placeholders that have not been verified against
-a live "use a backup code instead" screen yet.
+the top of this file if the flow breaks. The 2FA selectors were verified
+against the live "Verify your identity" / "Enter your code" pages (July
+2026): Send Code is clicked with the pre-selected method, and the backup
+code goes into the same #twoFactorCode input.
 """
 
 import asyncio
@@ -52,21 +53,15 @@ SEL_EMAIL = "#email"
 SEL_BTN_NEXT = "#logInBtn"
 SEL_PASSWORD = "#password"
 SEL_BTN_SIGNIN = "#logInBtn"
-# "Verify your identity" intermediate page
+# "Verify your identity" intermediate page — the preferred verification
+# method is pre-selected, so we only need to click Send Code.
 SEL_BTN_SEND_CODE = "#btnSendCode"
 
-# Backup-code 2FA — UNVERIFIED, best-effort selectors
-SEL_USE_ANOTHER_WAY = (
-    "a:has-text('another way'), a:has-text('Use a different way'), "
-    "button:has-text('another way'), a:has-text('backup code'), "
-    "div[class*='radio']:has-text('backup code')"
-)
-SEL_BACKUP_CODE_INPUTS = [
-    "input[name='backupCode']",
-    "#backupCode",
-    "input[placeholder*='backup' i]",
-    "input[placeholder*='code' i]",
-]
+# "Enter your code" page — the backup code goes into the one-time-code input.
+# <input type="text" id="twoFactorCode" name="oneTimeCode" …>
+SEL_2FA_CODE_INPUT = "#twoFactorCode"
+# <a role="button" id="btnSubmit" …>NEXT</a>
+SEL_BTN_2FA_SUBMIT = "#btnSubmit"
 
 # UT API fingerprint — we listen for this URL to grab session headers
 UT_ACCOUNTINFO_PATTERN = "utas"  # broad match; narrowed further in the handler
@@ -164,8 +159,10 @@ async def _check_remember_device(page: Page) -> None:
 
 async def _submit_2fa_code(page: Page) -> None:
     await asyncio.sleep(1)
-    for sel in ["#logInBtn", "a.otkbtn-primary", "button[type='submit']",
-                "a:has-text('NEXT')", ".otkbtn-primary"]:
+    # #btnSubmit is the verified NEXT button; the rest are fallbacks in case
+    # EA renames it again.
+    for sel in [SEL_BTN_2FA_SUBMIT, "#logInBtn", "a.otkbtn-primary",
+                "button[type='submit']", "a:has-text('NEXT')", ".otkbtn-primary"]:
         try:
             await page.click(sel, timeout=3_000)
             logger.info("2FA submit clicked via selector: %s", sel)
@@ -186,42 +183,34 @@ def _split_backup_codes(backup_code: str) -> list[str]:
 
 async def _handle_2fa_backup_code(page: Page, backup_code: str) -> None:
     """
-    UNVERIFIED best-effort flow:
-      1. "Verify your identity" page -> switch to the backup-code option
-      2. Backup-code entry page      -> fill code, submit; if the input is
-         still there after submitting (code rejected/spent), try the next
-         stored code.
+    Verified flow (EA "Verify your identity" / "Enter your code", July 2026):
+      1. The preferred verification method is already pre-selected on the
+         "Verify your identity" page — click Send Code (#btnSendCode).
+      2. On the "Enter your code" page, type a backup code into
+         #twoFactorCode, tick "Remember this device", and click NEXT
+         (#btnSubmit).
+      3. If the input is still there after submitting (code rejected/spent),
+         try the next stored code.
     Backup codes are single-use, so this should only ever be called once per
     account (during first_login). Returns silently if no 2FA prompt appears.
     """
     try:
         await page.wait_for_selector(SEL_BTN_SEND_CODE, timeout=8_000)
-        logger.info("'Verify your identity' page detected — switching to backup code…")
-        try:
-            await page.click(SEL_USE_ANOTHER_WAY, timeout=5_000)
-            await asyncio.sleep(0.3)
-        except Exception:
-            logger.debug("No explicit 'use another way' link found — trying direct backup-code input")
+        logger.info("'Verify your identity' page detected — clicking Send Code…")
+        await page.click(SEL_BTN_SEND_CODE)
     except PWTimeout:
-        logger.debug("No 'Verify your identity' page — checking for backup-code input directly")
+        logger.debug("No 'Verify your identity' page — checking for the code input directly")
 
-    code_selector: str | None = None
-    for sel in SEL_BACKUP_CODE_INPUTS:
-        try:
-            await page.wait_for_selector(sel, timeout=8_000)
-            code_selector = sel
-            break
-        except PWTimeout:
-            continue
-
-    if code_selector is None:
-        logger.warning("No backup-code input found — 2FA flow may have changed")
+    try:
+        await page.wait_for_selector(SEL_2FA_CODE_INPUT, timeout=15_000)
+    except PWTimeout:
+        logger.warning("No 2FA code input found — 2FA flow may have changed")
         return
 
     codes = _split_backup_codes(backup_code)
     for idx, code in enumerate(codes, start=1):
         logger.info("Entering backup code %d/%d…", idx, len(codes))
-        await page.fill(code_selector, code)
+        await page.fill(SEL_2FA_CODE_INPUT, code)
         await asyncio.sleep(0.3)
 
         await _check_remember_device(page)
@@ -230,14 +219,14 @@ async def _handle_2fa_backup_code(page: Page, backup_code: str) -> None:
         # Input gone (hidden/detached) → the code was accepted and the flow
         # moved on. Still visible → code rejected; try the next one.
         try:
-            await page.wait_for_selector(code_selector, state="hidden", timeout=8_000)
+            await page.wait_for_selector(SEL_2FA_CODE_INPUT, state="hidden", timeout=8_000)
             logger.info("Backup code %d/%d accepted", idx, len(codes))
             return
         except PWTimeout:
             if idx < len(codes):
                 logger.warning("Backup code %d/%d seems rejected — trying the next one", idx, len(codes))
                 try:
-                    await page.fill(code_selector, "")
+                    await page.fill(SEL_2FA_CODE_INPUT, "")
                 except Exception:
                     pass
             else:
@@ -385,7 +374,7 @@ async def password_relogin(
 
         # If 2FA shows up despite the remembered device, bail rather than
         # silently failing deeper in the flow.
-        for sel in (SEL_BTN_SEND_CODE, *SEL_BACKUP_CODE_INPUTS):
+        for sel in (SEL_BTN_SEND_CODE, SEL_2FA_CODE_INPUT):
             try:
                 await page.wait_for_selector(sel, timeout=3_000)
                 logger.warning(

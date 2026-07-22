@@ -897,3 +897,14 @@ waiting for navigation to "**/web-app/**" until 'load'
 2026-06-08 12:07:52 [INFO] __main__: Accounting scheduler started (every 9 hours)
 2026-06-08 12:08:14 [ERROR] asyncio: Unclosed client session
 client_session: <aiohttp.client.ClientSession object at 0x0000020DFC9B5550>
+2026-07-05 23:43:36 [INFO] db.database: Database schema ready
+2026-07-05 23:43:36 [INFO] db.database: DSFUT order stored: id=1 transaction=108252 player= account=b***@***
+2026-07-05 23:43:36 [INFO] db.database: Account added via bot: id=1 email=b***@***
+2026-07-05 23:43:36 [INFO] dsfut_browser.poller: ✅ DSFUT: picked up & stored order id=108252 coins=1490000 account=b***@***
+2026-07-05 23:43:36 [INFO] dsfut_browser.poller: DSFUT: order 108252 already stored — skipping duplicate
+2026-07-05 23:43:36 [INFO] dsfut_browser.poller: DSFUT: order 109999 lost — another supplier took it first
+2026-07-05 23:49:40 [INFO] test: ✅ DSFUT: picked up & stored order id=108252 account=b***@***
+2026-07-05 23:50:54 [INFO] db.database: Database schema ready
+2026-07-05 23:50:55 [INFO] db.database: DSFUT order stored: id=1 transaction=108252 player= account=b***@***
+2026-07-05 23:50:55 [INFO] db.database: Account added via bot: id=1 email=b***@***
+2026-07-05 23:50:55 [INFO] dsfut_browser.poller: ✅ DSFUT: picked up & stored order id=108252 coins=1490000 account=b***@***

@@ -108,10 +108,14 @@ async def send_order_complete(
     order_id: int,
     order_amount: int,
     transactions: list[dict],
+    price_per_100k: int | None = None,
 ) -> None:
     """
     Notify a client that their order has been fully processed.
     *transactions* is the list returned by get_transactions_for_order().
+    *price_per_100k* is the admin's per-100k purchase cost in Tomans, echoed
+    back verbatim; None renders as the literal "NotDefinedYet" so those
+    orders can be found and priced later.
 
     Large orders (100+ cards) produce more text than fits in one Telegram
     message, so the per-card blocks are split across as many messages as
@@ -138,7 +142,19 @@ async def send_order_complete(
         key = t.get("player_name") or t.get("card_name") or "—"
         groups.setdefault(key, []).append(t)
 
+    price_per_100k_display = (
+        f"{price_per_100k:,}" if price_per_100k is not None else "NotDefinedYet"
+    )
+
+    def _c_display(t: int) -> str:
+        # C = Tomans owed to the coin supplier for *t* transferred coins.
+        # No rate yet → the same "NotDefinedYet" marker as Price Per 100k.
+        if price_per_100k is None:
+            return "NotDefinedYet"
+        return f"{round(t / 100_000 * price_per_100k):,}"
+
     blocks: list[str] = []
+    total_transferred = 0
     for player_name, txs in groups.items():
         count = len(txs)
         total_bought = sum(t["bought_price"] for t in txs)
@@ -148,6 +164,11 @@ async def send_order_complete(
         position = next((t.get("position") for t in txs if t.get("position")), None)
         first_ts = min(t["listed_at"] for t in txs)
         last_ts = max(t["listed_at"] for t in txs)
+
+        # T = net profit for this line item: (buynow − EA's 5% sale fee)
+        # minus what the cards cost, across all cards in the group.
+        transferred = round(buy_now * 0.95 * count - total_bought)
+        total_transferred += transferred
 
         block = (
             f"🔢 Count: {count}\n"
@@ -159,9 +180,13 @@ async def send_order_complete(
             f"🛒 Buynow Price: {buy_now:,}\n"
             f"\n"
             f"✅ Bought Price: {total_bought:,}\n"
+            f"\n"
+            f"<b>🔁 Transferred Coins(T): {transferred:,}</b>\n"
+            f"<b>📊 Price Per 100k: {price_per_100k_display}</b>\n"
+            f"<b>🧮 C: {_c_display(transferred)}</b>\n"
         )
         if position:
-            block += f"\n📍 Position: {escape(position)}\n"
+            block += f"📍 Position: {escape(position)}\n"
         block += (
             f"⏳ ListedAt_from: {_fmt_ts_sec(first_ts)}\n"
             f"⌛️ ListedAt_to: {_fmt_ts_sec(last_ts)}"
@@ -169,7 +194,15 @@ async def send_order_complete(
         blocks.append(block + "\n─────────────────")
 
     ts = _fmt_ts(transactions[-1]["listed_at"] if transactions else _time.time())
-    blocks.append(f"📊 جمع کل: {len(transactions)} کارت\n⏰ {ts}")
+    total_block = ""
+    if len(groups) > 1:
+        # Multi-card orders: repeat the summed T (and C from that total T —
+        # the order has a single Price Per 100k) in the grand total.
+        total_block = (
+            f"<b>🔁 Transferred Coins(T): {total_transferred:,}</b>\n"
+            f"<b>🧮 C: {_c_display(total_transferred)}</b>\n"
+        )
+    blocks.append(total_block + f"📊 جمع کل: {len(transactions)} کارت\n⏰ {ts}")
 
     # Pack the blocks into as few messages as possible, each under the limit.
     chunks: list[str] = []
