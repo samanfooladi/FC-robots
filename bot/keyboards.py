@@ -88,6 +88,19 @@ def screenshot_account_picker_kb(accounts: list[dict]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def refresh_account_picker_kb(accounts: list[dict]) -> InlineKeyboardMarkup:
+    """Which logged-in EA account should have its FC Web App refreshed?"""
+    builder = InlineKeyboardBuilder()
+    for a in accounts:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🟢 {a['email']}",
+                callback_data=f"refreshacc:{a['id']}",
+            )
+        )
+    return builder.as_markup()
+
+
 def balance_account_picker_kb(accounts: list[dict]) -> InlineKeyboardMarkup:
     """Which logged-in account's balance to show? (/balance, with All)"""
     builder = InlineKeyboardBuilder()

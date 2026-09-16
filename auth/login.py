@@ -78,12 +78,13 @@ def _register_session_listeners(page: Page) -> dict[str, Any]:
     they fly by. Must be called BEFORE navigation so early accountinfo XHRs
     fired during web-app load are not missed.
     """
-    captured: dict[str, Any] = {}
+    captured: dict[str, Any] = {"_sid_event": asyncio.Event()}
 
     def _on_request(req: Request) -> None:
         if "utas" in req.url and req.headers.get("x-ut-sid"):
             logger.info("UT request intercepted: %s", req.url)
             captured.setdefault("sid", req.headers.get("x-ut-sid", ""))
+            captured["_sid_event"].set()
             captured.setdefault(
                 "phishing_token",
                 req.headers.get("x-ut-phishing-token", ""),
@@ -117,7 +118,19 @@ def _register_session_listeners(page: Page) -> dict[str, Any]:
 
     page.on("request", _on_request)
     page.on("response", _on_response)
+    captured["_request_listener"] = _on_request
+    captured["_response_listener"] = _on_response
     return captured
+
+
+def _remove_session_listeners(page: Page, captured: dict[str, Any]) -> None:
+    """Detach one capture pair so repeated card-cycle refreshes do not leak listeners."""
+    request_listener = captured.pop("_request_listener", None)
+    response_listener = captured.pop("_response_listener", None)
+    if request_listener is not None:
+        page.remove_listener("request", request_listener)
+    if response_listener is not None:
+        page.remove_listener("response", response_listener)
 
 
 async def _goto_webapp(page: Page) -> None:
@@ -135,9 +148,64 @@ async def _goto_webapp(page: Page) -> None:
         pass  # already on login form / already authenticated
 
 
-async def _fill_credentials(page: Page, email: str, password: str) -> None:
+async def _wait_for_login_form_or_session(
+    page: Page,
+    captured: dict[str, Any],
+) -> bool:
+    """
+    Return True when the email form appears, or False when a UT SID proves
+    that the persistent browser profile was authenticated automatically.
+
+    These two events race on startup: waiting only for #email incorrectly
+    turns a valid remembered session into a login timeout.
+    """
+    if captured.get("sid"):
+        return False
+
+    sid_event = captured.get("_sid_event")
+    if sid_event is None:
+        await page.wait_for_selector(SEL_EMAIL, timeout=20_000)
+        return True
+
+    email_task = asyncio.create_task(
+        page.wait_for_selector(SEL_EMAIL, timeout=20_000)
+    )
+    sid_task = asyncio.create_task(sid_event.wait())
+    try:
+        await asyncio.wait(
+            (email_task, sid_task),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # Prefer a captured SID if both events completed at nearly the same
+        # time: it is definitive evidence that the account is authenticated.
+        if captured.get("sid"):
+            return False
+
+        await email_task  # Propagate Playwright's timeout/navigation error.
+        return True
+    finally:
+        for task in (email_task, sid_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(email_task, sid_task, return_exceptions=True)
+
+
+async def _fill_credentials(
+    page: Page,
+    email: str,
+    password: str,
+    *,
+    captured: dict[str, Any] | None = None,
+) -> bool:
+    """Fill the EA form, returning False if an existing session logged in first."""
     logger.debug("Filling email…")
-    await page.wait_for_selector(SEL_EMAIL, timeout=20_000)
+    if captured is None:
+        await page.wait_for_selector(SEL_EMAIL, timeout=20_000)
+    elif not await _wait_for_login_form_or_session(page, captured):
+        logger.info("Existing authenticated session detected; skipping credentials")
+        return False
+
     await page.fill(SEL_EMAIL, email)
     await asyncio.sleep(0.5)
     await page.click(SEL_BTN_NEXT)
@@ -147,6 +215,7 @@ async def _fill_credentials(page: Page, email: str, password: str) -> None:
     await page.fill(SEL_PASSWORD, password)
     await asyncio.sleep(0.5)
     await page.click(SEL_BTN_SIGNIN)
+    return True
 
 
 async def _check_remember_device(page: Page) -> None:
@@ -240,33 +309,36 @@ async def _capture_ut_session(
     timeout: float = 60.0,
 ) -> SessionData | None:
     """Wait until UT session headers have been populated in *captured*."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if captured.get("sid"):
-            break
-        await asyncio.sleep(0.4)
-    else:
-        logger.error(
-            "Timed out waiting for UT SID (SID present=%s, phishing_token present=%s)",
-            bool(captured.get("sid")),
-            bool(captured.get("phishing_token")),
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if captured.get("sid"):
+                break
+            await asyncio.sleep(0.4)
+        else:
+            logger.error(
+                "Timed out waiting for UT SID (SID present=%s, phishing_token present=%s)",
+                bool(captured.get("sid")),
+                bool(captured.get("phishing_token")),
+            )
+            return None
+
+        captured.setdefault("phishing_token", "0")
+        if captured["phishing_token"] == "0":
+            logger.warning("phishing_token not captured — defaulting to '0'")
+
+        cookies = {c["name"]: c["value"] for c in await page.context.cookies()}
+
+        return SessionData(
+            account_id=account_id,
+            sid=captured["sid"],
+            phishing_token=captured["phishing_token"],
+            access_token=cookies.get("access_token", ""),
+            nucleus_id=captured.get("nucleus_id", ""),
+            cookies=cookies,
         )
-        return None
-
-    captured.setdefault("phishing_token", "0")
-    if captured["phishing_token"] == "0":
-        logger.warning("phishing_token not captured — defaulting to '0'")
-
-    cookies = {c["name"]: c["value"] for c in await page.context.cookies()}
-
-    return SessionData(
-        account_id=account_id,
-        sid=captured["sid"],
-        phishing_token=captured["phishing_token"],
-        access_token=cookies.get("access_token", ""),
-        nucleus_id=captured.get("nucleus_id", ""),
-        cookies=cookies,
-    )
+    finally:
+        _remove_session_listeners(page, captured)
 
 
 # ---------------------------------------------------------------------------
@@ -296,22 +368,35 @@ async def first_login(
             "First login attempt %d/%d for account %d (%s)",
             attempt, max_attempts, account_id, email,
         )
+        captured: dict[str, Any] = {}
         try:
             captured = _register_session_listeners(page)
             await _goto_webapp(page)
-            await _fill_credentials(page, email, password)
+            credentials_submitted = await _fill_credentials(
+                page,
+                email,
+                password,
+                captured=captured,
+            )
 
-            if backup_code:
+            if credentials_submitted and backup_code:
                 await _handle_2fa_backup_code(page, backup_code)
 
-            await page.wait_for_url("**/web-app/**", timeout=40_000)
-            await page.wait_for_load_state("networkidle", timeout=30_000)
+            if credentials_submitted:
+                await page.wait_for_url("**/web-app/**", timeout=40_000)
+                await page.wait_for_load_state("networkidle", timeout=30_000)
+            else:
+                logger.info(
+                    "Account %d is already authenticated by its persistent profile",
+                    account_id,
+                )
 
             session = await _capture_ut_session(page, account_id, captured)
             if session:
                 logger.info("First login successful for account %d", account_id)
                 return session
         except Exception:
+            _remove_session_listeners(page, captured)
             logger.exception("First login attempt error for account %d", account_id)
 
         if attempt < max_attempts:
@@ -335,21 +420,38 @@ async def restore_session(
     """
     captured = _register_session_listeners(page)
     try:
-        await _goto_webapp(page)
+        if "/web-app/" in page.url:
+            logger.debug("Account %d: reloading the live FC Web App", account_id)
+            await page.reload(timeout=30_000, wait_until="domcontentloaded")
+        else:
+            await _goto_webapp(page)
 
-        # If the profile is still authenticated, the email field never
-        # appears — the web app loads straight away.
-        try:
-            await page.wait_for_selector(SEL_EMAIL, timeout=5_000)
-            logger.info("Account %d: login form appeared — persistent session has died", account_id)
-            return None
-        except PWTimeout:
-            pass  # good: no login form, already authenticated
+        # A captured SID already proves that the persistent browser is still
+        # authenticated. Only spend time looking for the login form when no UT
+        # request appeared during navigation/reload.
+        if not captured.get("sid"):
+            try:
+                await page.wait_for_selector(SEL_EMAIL, timeout=5_000)
+                logger.info("Account %d: login form appeared — persistent session has died", account_id)
+                _remove_session_listeners(page, captured)
+                return None
+            except PWTimeout:
+                pass  # no login form; allow the UT request a little more time
 
         await page.wait_for_url("**/web-app/**", timeout=timeout * 1000)
-        await page.wait_for_load_state("networkidle", timeout=30_000)
+        # The FC SPA can keep analytics/polling requests alive indefinitely.
+        # Network-idle is useful when it happens, but it is not proof that the
+        # page or its UT session failed to load.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5_000)
+        except PWTimeout:
+            logger.debug(
+                "Account %d: web app stayed network-active; capturing UT session anyway",
+                account_id,
+            )
         return await _capture_ut_session(page, account_id, captured, timeout=timeout)
     except Exception:
+        _remove_session_listeners(page, captured)
         logger.exception("Session restore error for account %d", account_id)
         return None
 
@@ -381,6 +483,7 @@ async def password_relogin(
                     "Account %d: 2FA required during password-only re-login — manual intervention needed",
                     account_id,
                 )
+                _remove_session_listeners(page, captured)
                 return None
             except PWTimeout:
                 continue
@@ -389,5 +492,6 @@ async def password_relogin(
         await page.wait_for_load_state("networkidle", timeout=30_000)
         return await _capture_ut_session(page, account_id, captured)
     except Exception:
+        _remove_session_listeners(page, captured)
         logger.exception("Password-only re-login error for account %d", account_id)
         return None

@@ -16,6 +16,16 @@ accounting.
 Multiple EA accounts can be logged in simultaneously; the admin chooses
 which account processes each order.
 
+There are two independent order workflows:
+  1. DSFUT pickup automation is controlled only by /take_on and /take_off.
+     /take_on opens the DSFUT board and keeps that browser open while the fast
+     pickup loop runs; /take_off stops polling and closes it. Newly claimed
+     console orders are stored. It defaults to ON after a restart when
+     DSFUT_ENABLED=true.
+  2. /order {amount} [price_per_100k] is an FC Web App card order. It searches,
+     buys, and lists cards on the logged-in EA account selected by the admin.
+     It does not start, stop, or otherwise control the DSFUT poller.
+
 
 KEY FEATURES
 ------------
@@ -33,9 +43,10 @@ KEY FEATURES
   - Persistent browsers   : Each account owns a persistent Chrome profile
                             (data/profiles/{id}); admin-chosen accounts stay
                             logged in and are auto-restored after a restart.
-  - Session management    : Expired sessions (HTTP 401) trigger an automatic
-                            password-only re-login using the remembered
-                            device — backup codes are never auto-respent.
+  - Session management    : Expired UT sessions (HTTP 401) first refresh the
+                            still-authenticated FC Web App and capture its new
+                            SID. Password-only login is a fallback; backup
+                            codes are never auto-respent.
   - Transfer market API   : Searches, buys, moves to tradepile, and lists
                             cards via EA's internal httpx-based API.
   - Multi-account orders  : When several accounts are logged in, /order asks
@@ -107,6 +118,9 @@ CONFIGURATION (.env)
                          Seconds between browser health checks. Default: 300
 
   REQUEST_DELAY_MIN/MAX  Random pause between EA API requests. Default 0.5–2.0
+  BROWSER_SYNC_EVERY_CARDS
+                         Refresh the visible Web App every N listed cards.
+                         Default 10; the final card and HTTP 401 always refresh.
 
   EA account credentials are NOT stored in .env — accounts are added from
   Telegram via /addaccount and stored in the database.
@@ -125,6 +139,9 @@ TELEGRAM COMMANDS (all admin-only)
                       Tap one → "Login as X? Yes/No" → logs in and keeps
                       the account logged in until you log it out.
   /logout             Same pattern for logging out a logged-in account.
+  /refresh            Refresh a logged-in EA Web App account and capture its
+                      new session. With several logged-in accounts, asks which
+                      account should be refreshed. Does not affect DSFUT.
   /removeaccount {id} Disable an account (also logs it out).
   /cancel             Abort the current conversation (e.g. mid /addaccount).
 

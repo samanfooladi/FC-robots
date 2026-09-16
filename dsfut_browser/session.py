@@ -45,6 +45,11 @@ class DsfutBrowserSession:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
+        # Re-login reuses the browser that /take_on already opened.  Starting a
+        # second persistent context for the same profile would fail because the
+        # profile is locked by the first Chromium process.
+        if self.context is not None:
+            return
         self._pw = await async_playwright().start()
         self.context = await self._pw.chromium.launch_persistent_context(
             self.profile_dir,
@@ -109,13 +114,16 @@ class DsfutBrowserSession:
         except PWError:
             return False
 
-    async def ensure_logged_in(self, *, interactive: bool = True) -> bool:
+    async def ensure_logged_in(
+        self, *, interactive: bool = True, navigate: bool = True
+    ) -> bool:
         """
         Navigate to the board page and confirm we are authenticated. If not and
         *interactive*, ask the human to solve the captcha in the visible window
         and press Enter, then re-check once. Returns True only when logged in.
         """
-        await self.goto_board()
+        if navigate:
+            await self.goto_board()
         if not await self.is_logged_out():
             logger.info("DSFUT: existing session is authenticated")
             return True

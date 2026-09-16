@@ -335,6 +335,45 @@ class BrowserPool:
         async with entry.lock:
             return await self._force_relogin_locked(entry)
 
+    async def refresh_session(self, account_id: int) -> SessionData | None:
+        """
+        Refresh the live FC Web App and capture the session it creates.
+
+        A 401 from the UT API does not necessarily mean that the EA website
+        login has expired. In the common case the persistent browser is still
+        authenticated and a page refresh issues a new X-UT-SID. Only fall back
+        to the password flow when that browser-session restore really fails.
+        """
+        entry = self._entries.get(account_id)
+        if entry is None:
+            return None
+
+        async with entry.lock:
+            session = None
+            for attempt in (1, 2):
+                session = await restore_session(entry.page, account_id=account_id)
+                if session is not None:
+                    break
+                logger.warning(
+                    "Account %d: FC Web App session capture failed (%d/2)",
+                    account_id,
+                    attempt,
+                )
+            if session is None:
+                logger.info(
+                    "Account %d: two browser refreshes did not restore UT session; "
+                    "falling back to password re-login",
+                    account_id,
+                )
+                session = await self._force_relogin_locked(entry)
+            if session is None:
+                return None
+
+            entry.session = session
+            await save_session(session)
+            logger.info("Account %d: FC Web App refreshed and session captured", account_id)
+            return session
+
     async def _force_relogin_locked(self, entry: "_PoolEntry") -> SessionData | None:
         """Caller must hold entry.lock."""
         session = await password_relogin(

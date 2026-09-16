@@ -884,6 +884,28 @@ async def insert_dsfut_order(
     return new_id
 
 
+async def get_known_dsfut_order_ids() -> set[str]:
+    """
+    Return every DSFUT order identifier already present in our history.
+
+    All statuses are included deliberately: an order that we previously took
+    and later cancelled must never be picked up again if DSFUT puts it back on
+    the public board.
+    """
+    known: set[str] = set()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
+        async with db.execute(
+            "SELECT transaction_id, trade_id FROM dsfut_orders"
+        ) as cur:
+            async for transaction_id, trade_id in cur:
+                if transaction_id is not None:
+                    known.add(str(transaction_id))
+                if trade_id is not None:
+                    known.add(str(trade_id))
+    return known
+
+
 async def link_dsfut_order_account(order_id: int, ea_account_id: int) -> None:
     """Point a stored DSFUT order at the ea_accounts row created for it."""
     async with aiosqlite.connect(DB_PATH) as db:

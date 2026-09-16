@@ -26,7 +26,7 @@ from asyncio import Queue
 from aiogram import Bot
 
 from auth.session import SessionData
-from config import ADMIN_IDS
+from config import ADMIN_IDS, BROWSER_SYNC_EVERY_CARDS
 from db.database import (
     count_transactions_for_order,
     get_order_with_card,
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 SEARCH_WAIT_S = 30           # seconds to wait between empty-search retries
 MAX_BUY_FAILS = 3            # consecutive buy errors before aborting
 MAX_LIST_FAILS = 3           # move/list retries for one held card before aborting
-CYCLE_DELAY_MIN = 2.0        # seconds — extra pause after each buy+list cycle
+CYCLE_DELAY_MIN = 2.0        # seconds — retry backoff after a failed operation
 CYCLE_DELAY_MAX = 5.0
 
 # ── Buy-price escalation ────────────────────────────────────────────────────
@@ -149,6 +149,7 @@ class OrderWorker:
 
         # ── Mark running ──────────────────────────────────────────────────────
         await update_order_status(order_id, "in_progress")
+        started_at = time.monotonic()
         logger.info(
             "Order #%d started: card=%s qty=%d buy_range=%d-%d list_at=%d",
             order_id,
@@ -202,7 +203,14 @@ class OrderWorker:
 
         # ── Order complete ────────────────────────────────────────────────────
         await update_order_status(order_id, "done")
-        logger.info("Order #%d complete — %d cards listed", order_id, quantity)
+        elapsed_s = time.monotonic() - started_at
+        logger.info(
+            "Order #%d complete — %d cards listed in %.1fs (%.1f cards/min)",
+            order_id,
+            quantity,
+            elapsed_s,
+            quantity * 60 / elapsed_s if elapsed_s else 0,
+        )
 
         if not ordered_by:
             return
@@ -288,6 +296,11 @@ class OrderWorker:
         # to a different listing instead of looping on the stale one.
         seen_trade_ids: set[int] = set()
 
+        # One search returns up to 21 auctions. Consume all matching copies
+        # before searching again instead of throwing away the other results.
+        # This removes one HTTP request (and its pacing delay) from most cycles.
+        listing_cache = []
+
         # A card that has been bought but not yet listed.  It is retried for
         # move/list on the next iteration rather than abandoned, so a transient
         # listing failure never makes the order deliver fewer cards than ordered.
@@ -298,86 +311,95 @@ class OrderWorker:
 
             # ── ACQUIRE (search + buy) unless we already hold a card ──────────
             if held is None:
-                # ── SEARCH ────────────────────────────────────────────────────
-                # Locked onto a player → search just that player so we see *all*
-                # their listings in range (an open band search only returns the
-                # global cheapest few, which can hide them).  Otherwise do an
-                # open band search to discover whichever card is cheapest now.
-                search_cfg = dict(card_config)
-                search_cfg["buy_price_max"] = current_max
-                if locked_resource_id:
-                    search_cfg["resource_id"] = locked_resource_id
+                if listing_cache:
+                    cheapest = listing_cache.pop(0)
                 else:
-                    search_cfg.pop("resource_id", None)
+                    # ── SEARCH ────────────────────────────────────────────────
+                    # Locked onto a player → search just that player so we see
+                    # all their listings. Otherwise discover the cheapest card.
+                    search_cfg = dict(card_config)
+                    search_cfg["buy_price_max"] = current_max
+                    if locked_resource_id:
+                        search_cfg["resource_id"] = locked_resource_id
+                    else:
+                        search_cfg.pop("resource_id", None)
 
-                listings = await search_card(self.session, search_cfg)
+                    listings = await search_card(self.session, search_cfg)
 
-                if self.session.expired:
-                    if not await self._refresh_session():
-                        raise _OrderAborted("session expired during search — refresh failed")
-                    continue
-
-                # Drop listings we've already bought / found unavailable, and —
-                # when locked — keep only the targeted player, so the cheapest
-                # *fresh* copy of the right card is picked.
-                fresh = [l for l in listings if l.trade_id not in seen_trade_ids]
-                if locked_resource_id:
-                    fresh = [l for l in fresh if l.resource_id == locked_resource_id]
-
-                if not fresh:
-                    # Locked onto a player who is now sold out → switch to the
-                    # next card in the band (unless the order is pinned to one
-                    # player, in which case this counts as a price miss instead).
-                    if locked_resource_id and not fixed_player:
-                        logger.info(
-                            "Order #%d: no more '%s' in range ≤%d — switching to another card",
-                            order_id, locked_player_name, current_max,
-                        )
-                        locked_resource_id = None
+                    if self.session.expired:
+                        if not await self._refresh_session():
+                            raise _OrderAborted("session expired during search — refresh failed")
+                        listing_cache.clear()
                         continue
 
-                    # Nothing buyable in range at all.  After SWITCHES_BEFORE_BUMP
-                    # consecutive misses, raise the max price by PRICE_BUMP until
-                    # the ceiling, then abort rather than overpay.
-                    no_find_count += 1
-                    logger.info(
-                        "Order #%d: nothing in range [%d-%d] (miss %d/%d, %d stale)",
-                        order_id,
-                        card_config["buy_price_min"],
-                        current_max,
-                        no_find_count,
-                        SWITCHES_BEFORE_BUMP,
-                        len(listings),
-                    )
-                    if no_find_count >= SWITCHES_BEFORE_BUMP:
-                        if current_max < MAX_BUY_PRICE:
-                            new_max = min(current_max + PRICE_BUMP, MAX_BUY_PRICE)
-                            logger.info(
-                                "Order #%d: raising max buy price %d → %d after %d misses",
-                                order_id, current_max, new_max, no_find_count,
-                            )
-                            current_max = new_max
-                            no_find_count = 0
-                            if not fixed_player:
-                                locked_resource_id = None
-                            continue  # search again immediately at the higher price
-                        raise _OrderAborted(
-                            f"no listings found in range up to the max buy price "
-                            f"({MAX_BUY_PRICE}) after price escalation"
-                        )
-                    await asyncio.sleep(SEARCH_WAIT_S)
-                    continue
+                    # Drop listings already bought / unavailable. When locked,
+                    # retain only copies of the selected player.
+                    fresh = [l for l in listings if l.trade_id not in seen_trade_ids]
+                    if locked_resource_id:
+                        fresh = [l for l in fresh if l.resource_id == locked_resource_id]
 
-                no_find_count = 0
-                cheapest = fresh[0]
-                if not locked_resource_id:
-                    # First copy of a new card — lock onto it so subsequent
-                    # iterations keep buying the same player.
-                    locked_resource_id = cheapest.resource_id
-                    logger.info(
-                        "Order #%d: locked onto card resource=%d price=%d",
-                        order_id, locked_resource_id, cheapest.buy_now_price,
+                    if not fresh:
+                        # A non-fixed player sold out: unlock and discover the
+                        # next card in the configured rating band.
+                        if locked_resource_id and not fixed_player:
+                            logger.info(
+                                "Order #%d: no more '%s' in range ≤%d — switching to another card",
+                                order_id, locked_player_name, current_max,
+                            )
+                            locked_resource_id = None
+                            continue
+
+                        # Nothing buyable in range. Escalate after repeated misses.
+                        no_find_count += 1
+                        logger.info(
+                            "Order #%d: nothing in range [%d-%d] (miss %d/%d, %d stale)",
+                            order_id,
+                            card_config["buy_price_min"],
+                            current_max,
+                            no_find_count,
+                            SWITCHES_BEFORE_BUMP,
+                            len(listings),
+                        )
+                        if no_find_count >= SWITCHES_BEFORE_BUMP:
+                            if current_max < MAX_BUY_PRICE:
+                                new_max = min(current_max + PRICE_BUMP, MAX_BUY_PRICE)
+                                logger.info(
+                                    "Order #%d: raising max buy price %d → %d after %d misses",
+                                    order_id, current_max, new_max, no_find_count,
+                                )
+                                current_max = new_max
+                                no_find_count = 0
+                                if not fixed_player:
+                                    locked_resource_id = None
+                                continue  # search again immediately at the higher price
+                            raise _OrderAborted(
+                                f"no listings found in range up to the max buy price "
+                                f"({MAX_BUY_PRICE}) after price escalation"
+                            )
+                        await asyncio.sleep(SEARCH_WAIT_S)
+                        continue
+
+                    no_find_count = 0
+                    cheapest = fresh[0]
+                    if not locked_resource_id:
+                        # Lock so subsequent iterations buy the same player.
+                        locked_resource_id = cheapest.resource_id
+                        logger.info(
+                            "Order #%d: locked onto card resource=%d price=%d",
+                            order_id, locked_resource_id, cheapest.buy_now_price,
+                        )
+
+                    # The initial open-band search may contain multiple players;
+                    # cache only copies of the player we just locked onto.
+                    listing_cache.extend(
+                        l for l in fresh[1:]
+                        if l.resource_id == locked_resource_id
                     )
+                    logger.info(
+                        "Order #%d: retained %d additional listing(s) from one search",
+                        order_id, len(listing_cache),
+                    )
+
                 logger.debug(
                     "Order #%d: cheapest fresh listing trade=%d price=%d",
                     order_id,
@@ -391,6 +413,7 @@ class OrderWorker:
                 if self.session.expired:
                     if not await self._refresh_session():
                         raise _OrderAborted("session expired during buy — refresh failed")
+                    listing_cache.clear()
                     continue
 
                 if result.error == "item_unavailable":
@@ -459,6 +482,7 @@ class OrderWorker:
             if self.session.expired:
                 if not await self._refresh_session():
                     raise _OrderAborted("session expired moving to tradepile — refresh failed")
+                listing_cache.clear()
                 moved = await move_to_tradepile(self.session, item_id)
 
             if not moved:
@@ -484,8 +508,6 @@ class OrderWorker:
                 await human_delay(CYCLE_DELAY_MIN, CYCLE_DELAY_MAX)
                 continue  # keep `held` and retry the same card
 
-            await asyncio.sleep(2)
-
             # ── LIST ──────────────────────────────────────────────────────────
             logger.info(
                 "About to list item=%d buy_now=%d start_bid=%d",
@@ -501,6 +523,7 @@ class OrderWorker:
             if self.session.expired:
                 if not await self._refresh_session():
                     raise _OrderAborted("session expired during list — refresh failed")
+                listing_cache.clear()
                 list_result = await list_card(
                     self.session,
                     item_id,
@@ -575,8 +598,27 @@ class OrderWorker:
             )
             held = None  # card delivered — clear so the next loop buys a new one
 
-            # ── INTER-CYCLE DELAY ─────────────────────────────────────────────
-            await human_delay(CYCLE_DELAY_MIN, CYCLE_DELAY_MAX)
+            # Browser navigation is much slower than the market API. Sync only
+            # periodically (and after the final card), rather than after every
+            # card. HTTP 401 still triggers an immediate refresh above.
+            should_sync_browser = cards_listed == quantity or (
+                BROWSER_SYNC_EVERY_CARDS > 0
+                and cards_listed % BROWSER_SYNC_EVERY_CARDS == 0
+            )
+            if should_sync_browser:
+                refreshed = await self.browser_pool.refresh_session(self.account_id)
+                if refreshed is not None:
+                    self.session = refreshed
+                    # Browser navigation can make cached auctions stale.
+                    listing_cache.clear()
+                else:
+                    logger.warning(
+                        "Order #%d: card listed, but FC Web App refresh failed; continuing",
+                        order_id,
+                    )
+
+            # Every market request already applies REQUEST_DELAY_MIN/MAX. There
+            # is no extra delay after success; retry paths keep their backoff.
 
     # ─────────────────────────────────────────────────────────────────────────
     # Session refresh
@@ -584,12 +626,13 @@ class OrderWorker:
 
     async def _refresh_session(self) -> bool:
         """
-        Ask the BrowserPool to re-authenticate this account (password-only,
-        via its persistent browser profile).  Updates self.session on
-        success.  Returns True on success.
+        Ask the BrowserPool to refresh the still-authenticated FC Web App and
+        capture its new UT session. Password re-login is only a fallback when
+        the persistent website login has genuinely expired. Updates
+        self.session on success and returns True.
         """
         logger.info(
-            "Account %d: session expired — requesting re-login from BrowserPool (%s)…",
+            "Account %d: UT session expired — refreshing FC Web App (%s)…",
             self.account_id,
             self.email,
         )
@@ -597,14 +640,14 @@ class OrderWorker:
         if self.session is not None:
             self.session.expired = False
 
-        new_session = await self.browser_pool.force_relogin(self.account_id)
+        new_session = await self.browser_pool.refresh_session(self.account_id)
 
         if new_session:
             self.session = new_session
-            logger.info("Account %d: re-login successful (new SID=%s…)", self.account_id, new_session.sid[:12])
+            logger.info("Account %d: session refresh successful (new SID=%s…)", self.account_id, new_session.sid[:12])
             return True
 
-        logger.error("Account %d: re-login FAILED", self.account_id)
+        logger.error("Account %d: session refresh FAILED", self.account_id)
         await self._notify_admins(
             f"❌ <b>Session refresh failed</b>\n"
             f"Account {self.account_id} (<code>{self.email}</code>)\n"

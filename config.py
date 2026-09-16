@@ -23,6 +23,13 @@ LOG_LEVEL: int = _LOG_LEVEL_MAP.get(os.getenv("LOG_LEVEL", "INFO").upper(), _log
 # Request pacing
 REQUEST_DELAY_MIN: float = float(os.getenv("REQUEST_DELAY_MIN", "0.5"))
 REQUEST_DELAY_MAX: float = float(os.getenv("REQUEST_DELAY_MAX", "2.0"))
+# Refreshing the visible Web App is comparatively expensive and is not needed
+# for every API-driven card. A value of 10 keeps the UI/session periodically
+# synchronized without adding one full browser navigation per card. 0 disables
+# periodic refreshes; the worker still refreshes on the final card and on 401.
+BROWSER_SYNC_EVERY_CARDS: int = max(
+    0, int(os.getenv("BROWSER_SYNC_EVERY_CARDS", "10"))
+)
 
 # Browser pool / persistent Chrome profiles
 PROFILES_DIR = Path(os.getenv("PROFILES_DIR", "data/profiles"))

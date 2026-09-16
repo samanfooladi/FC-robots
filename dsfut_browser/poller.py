@@ -1,9 +1,11 @@
 """
-DSFUT order poller — fast HTTP loop with Playwright only for login.
+DSFUT order poller — fast HTTP loop with a visible Playwright session.
 
 Startup / re-login uses the persistent Playwright context (manual captcha,
 handled in session.py). Once authenticated, the session cookies are handed to
-an httpx client and the hot loop is pure HTTP:
+an httpx client and the hot loop is pure HTTP.  The DSFUT browser remains open
+for the whole enabled period, so /take_on visibly opens the site and /take_off
+is the operation that closes it:
 
   1. GET /api/json/comfortables            (poll, ~every 100 ms)
   2. filter PlayStation/Xbox orders, skip PC
@@ -20,6 +22,7 @@ admin Telegram message only. They never appear in logs — emails are redacted.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -40,6 +43,7 @@ from config import (
 )
 from db.database import (
     add_account,
+    get_known_dsfut_order_ids,
     insert_dsfut_order,
     link_dsfut_order_account,
     update_account_credentials,
@@ -86,8 +90,9 @@ class DsfutBrowserPoller:
             DSFUT_BOARD_URL,
         )
         self.http = DsfutHttpClient(DSFUT_BOARD_URL, _USER_AGENT, DSFUT_HTTP_TIMEOUT_S)
-        # Orders already claimed/lost this run — avoids re-attempting a pickup
-        # every poll while the same id lingers on the board.
+        # Preloaded from persistent history before polling starts, then extended
+        # with orders handled during this run. This prevents both cancelled old
+        # orders and lingering board entries from being picked up again.
         self._handled: set[str] = set()
         # Coins tied up in our active orders, for the DSFUT_MAX_ACTIVE_COINS
         # filter. Refreshed from /comfortable/active at most every
@@ -97,6 +102,24 @@ class DsfutBrowserPoller:
         # Orders skipped over the cap, so the skip is logged once per order,
         # not every poll. NOT _handled: they are retried when capacity frees up.
         self._cap_logged: set[str] = set()
+        # /take_off: set to make the fast loop exit after the CURRENT cycle
+        # completes — in-flight requests are never aborted, and no further
+        # HTTP request is made once set.
+        self._stop = asyncio.Event()
+        # Lets the manager wait until /take_on has actually opened the DSFUT
+        # board before it reports success to Telegram.
+        self._board_opened = asyncio.Event()
+
+    def request_stop(self) -> None:
+        """Ask the loop to stop after the in-flight cycle finishes."""
+        self._stop.set()
+
+    async def _stop_aware_sleep(self, seconds: float) -> None:
+        """asyncio.sleep that returns immediately once a stop is requested."""
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
 
     # ------------------------------------------------------------------
     # Entry point
@@ -108,6 +131,7 @@ class DsfutBrowserPoller:
             DSFUT_BOARD_URL, DSFUT_POLL_INTERVAL_S, DSFUT_BROWSER_HEADLESS,
         )
         try:
+            await self._load_handled_history()
             if not await self._login_and_load_cookies():
                 await self._alert(
                     "⚠️ DSFUT poller could not log in — a manual login is needed "
@@ -123,6 +147,15 @@ class DsfutBrowserPoller:
             await self.session.close()
             logger.info("DSFUT poller stopped")
 
+    async def _load_handled_history(self) -> None:
+        """Fail closed: load old DSFUT IDs before any pickup can be sent."""
+        historical_ids = await get_known_dsfut_order_ids()
+        self._handled.update(historical_ids)
+        logger.info(
+            "DSFUT: loaded %d previously handled order id(s); repeats will be skipped",
+            len(historical_ids),
+        )
+
     # ------------------------------------------------------------------
     # Login / cookie handoff (Playwright)
     # ------------------------------------------------------------------
@@ -130,19 +163,22 @@ class DsfutBrowserPoller:
     async def _login_and_load_cookies(self) -> bool:
         """
         Bring up the Playwright context, ensure we are logged in, copy the
-        cookies into the HTTP client, then close the browser (the fast loop is
-        HTTP-only, so we don't hold the profile lock or a window open).
+        cookies into the HTTP client, and keep the DSFUT browser open until
+        /take_off. Re-login reuses that same context.
         """
         await self.session.start()
-        try:
-            if not await self.session.ensure_logged_in():
-                logger.error("DSFUT: login was not completed — poller idle until restart")
-                return False
-            count = await self.http.rebuild(await self.session.export_cookies())
-            logger.info("DSFUT: loaded %d session cookie(s) into the HTTP client", count)
-            return True
-        finally:
-            await self.session.close()
+        await self.session.goto_board()
+        self._board_opened.set()
+        if not await self.session.ensure_logged_in(navigate=False):
+            logger.error("DSFUT: login was not completed — poller idle until restart")
+            return False
+        count = await self.http.rebuild(await self.session.export_cookies())
+        logger.info("DSFUT: loaded %d session cookie(s) into the HTTP client", count)
+        return True
+
+    async def wait_until_board_opened(self) -> None:
+        """Return once Chromium has navigated to the DSFUT board."""
+        await self._board_opened.wait()
 
     # ------------------------------------------------------------------
     # Fast loop
@@ -150,7 +186,7 @@ class DsfutBrowserPoller:
 
     async def _fast_loop(self) -> None:
         backoff = 1.0
-        while True:
+        while not self._stop.is_set():
             try:
                 await self._maybe_refresh_active_coins()
                 data = await self.http.poll_comfortables()
@@ -158,25 +194,29 @@ class DsfutBrowserPoller:
                 if orders:
                     await self._handle_batch(orders)
                 backoff = 1.0
-                await asyncio.sleep(DSFUT_POLL_INTERVAL_S)
+                await self._stop_aware_sleep(DSFUT_POLL_INTERVAL_S)
 
             except asyncio.CancelledError:
                 raise
             except SessionExpired as exc:
                 logger.error("DSFUT: session expired (%s) — re-login via Playwright", exc)
                 await self._alert("⚠️ DSFUT session expired — re-login in the Chromium window on the server.")
+                if self._stop.is_set():
+                    break  # stopping anyway — don't start a re-login
                 if await self._login_and_load_cookies():
                     logger.info("DSFUT: re-login successful — resuming fast loop")
                 else:
                     logger.error("DSFUT: re-login not completed — waiting before retry")
-                    await asyncio.sleep(_MAX_BACKOFF_S)
+                    await self._stop_aware_sleep(_MAX_BACKOFF_S)
             except httpx.HTTPError as exc:
                 logger.warning("DSFUT: HTTP error in fast loop — backoff %.1fs: %s", backoff, exc)
-                await asyncio.sleep(backoff)
+                await self._stop_aware_sleep(backoff)
                 backoff = min(backoff * 2, _MAX_BACKOFF_S)
             except Exception:
                 logger.exception("DSFUT: unexpected fast-loop error — continuing")
-                await asyncio.sleep(1.0)
+                await self._stop_aware_sleep(1.0)
+        if self._stop.is_set():
+            logger.info("DSFUT poller: stop requested — loop exited after the current cycle")
 
     async def _maybe_refresh_active_coins(self) -> None:
         """Re-read the coins tied up in our active orders when the total is stale."""
@@ -458,3 +498,117 @@ async def send_dsfut_notification(bot, **kwargs) -> None:
     """Thin wrapper (lazy import) around the existing admin notification."""
     from bot.notifications import send_dsfut_order_created
     await send_dsfut_order_created(bot, ADMIN_IDS, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Poller lifecycle — /take_on and /take_off
+# ---------------------------------------------------------------------------
+
+
+class DsfutPollerManager:
+    """
+    Start/stop wrapper around DsfutBrowserPoller for /take_on and /take_off.
+
+    Uses the same asyncio.Task pattern main.py already used for the poller.
+    While stopped, NO polling happens at all — no HTTP requests to DSFUT.
+    Stop is cooperative: the loop finishes its in-flight cycle and exits
+    before the next request; a hard cancel() only fires if the poller does
+    not come down within the grace window (e.g. it is stuck in the
+    manual-captcha Playwright login, which has no natural end).
+
+    The on/off state is deliberately in-memory only — every process start
+    goes back to the DSFUT_ENABLED default.
+    """
+
+    # In-flight HTTP requests use DSFUT_HTTP_TIMEOUT_S (15 s default), so a
+    # cooperative stop normally completes well inside this window.
+    _STOP_GRACE_S = 20.0
+    _START_GRACE_S = 45.0
+
+    def __init__(self, bot: Bot | None, enabled_in_env: bool) -> None:
+        self.bot = bot
+        self.enabled_in_env = enabled_in_env
+        self._poller: DsfutBrowserPoller | None = None
+        self._task: asyncio.Task | None = None
+        # Serialises concurrent /take_on / /take_off so the task can never be
+        # double-started or torn down twice.
+        self._lock = asyncio.Lock()
+
+    def is_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    async def start(self) -> bool:
+        """
+        Start polling and wait briefly for Chromium to really open.
+
+        Returns False when already running.  A launch failure is raised so the
+        Telegram handler cannot claim that polling started when the task died
+        before opening DSFUT.
+        """
+        async with self._lock:
+            if self.is_running():
+                return False
+            self._poller = DsfutBrowserPoller(self.bot)
+            self._task = asyncio.create_task(self._poller.run(), name="dsfut-poller")
+            logger.info("DSFUT poller task started (/take_on or startup)")
+            board_opened = asyncio.create_task(
+                self._poller.wait_until_board_opened(),
+                name="dsfut-board-start-wait",
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {self._task, board_opened},
+                    timeout=self._START_GRACE_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if self._task in done:
+                    task = self._task
+                    self._task = None
+                    self._poller = None
+                    # Consume and propagate the real startup exception.
+                    await task
+                    raise RuntimeError("DSFUT poller stopped before the board opened")
+                if board_opened not in done:
+                    task = self._task
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    self._task = None
+                    self._poller = None
+                    raise TimeoutError(
+                        f"DSFUT board did not open within {self._START_GRACE_S:.0f}s"
+                    )
+            finally:
+                if not board_opened.done():
+                    board_opened.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await board_opened
+            return True
+
+    async def stop(self) -> bool:
+        """Stop polling. Returns False when it is already stopped."""
+        async with self._lock:
+            if not self.is_running():
+                return False
+            task = self._task
+            self._poller.request_stop()
+            try:
+                # On timeout wait_for cancels the task and awaits it — the
+                # hard-stop fallback.
+                await asyncio.wait_for(task, timeout=self._STOP_GRACE_S)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "DSFUT poller did not stop within %.0fs — cancelled",
+                    self._STOP_GRACE_S,
+                )
+            except Exception:
+                logger.exception("DSFUT poller task ended with an error during stop")
+            self._task = None
+            self._poller = None
+            logger.info("DSFUT poller task stopped (/take_off)")
+            return True
+
+    def shutdown(self) -> None:
+        """Process shutdown: cancel outright (same as the old dsfut_task.cancel())."""
+        if self._task is not None and not self._task.done():
+            self._task.cancel()

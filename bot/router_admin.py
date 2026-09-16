@@ -10,6 +10,8 @@ Account management
   /removeaccount {id}
 
 Evidence / status
+  /refresh      reload one logged-in account's EA FC Web App and capture the
+                new UT session (0 online → error; 1 → immediate; several → picker)
   /screenshot   viewport screenshot of a logged-in account's web-app page
                 (0 online → error; 1 → straight shot; several → picker)
   /balance      coin balance of a logged-in account
@@ -56,6 +58,7 @@ from bot.keyboards import (
     logout_list_kb,
     order_account_picker_kb,
     order_no_price_confirm_kb,
+    refresh_account_picker_kb,
     screenshot_account_picker_kb,
     screenshot_prompt_kb,
 )
@@ -81,6 +84,7 @@ from market.tradepile import get_tradepile_response
 
 if TYPE_CHECKING:
     from browser_pool.pool import BrowserPool
+    from dsfut_browser.poller import DsfutPollerManager
     from order_queue.manager import QueueManager
 
 logger = logging.getLogger(__name__)
@@ -121,6 +125,7 @@ async def cmd_start(message: Message) -> None:
         "  /addaccount — add an EA account (step by step)\n"
         "  /accounts — manage accounts: login / logout / delete\n"
         "  /logout — log an account out\n"
+        "  /refresh — refresh a logged-in EA account\n"
         "  /screenshot — screenshot of a logged-in account\n"
         "  /balance — coin balance of logged-in accounts\n"
         "  /checkcards — transfer list report + Clear Sold / Re-list All\n"
@@ -128,7 +133,8 @@ async def cmd_start(message: Message) -> None:
         "<b>Trading</b>\n"
         "  /setcard — configure the card to trade\n"
         "  /order {amount} [price_per_100k] — place an order, e.g. <code>/order 100k 30000</code>\n"
-        "  /report — profit report",
+        "  /report — profit report\n"
+        "  /take_on / /take_off — start / stop DSFUT order polling",
         parse_mode="HTML",
     )
 
@@ -470,8 +476,55 @@ async def cb_logout_confirm(
 
 
 # ---------------------------------------------------------------------------
-# /screenshot & /balance — proof-of-balance evidence for order fulfilment
+# /refresh, /screenshot & /balance — EA account session and evidence tools
 # ---------------------------------------------------------------------------
+
+
+async def _refresh_account(
+    message: Message, browser_pool: "BrowserPool", account: dict
+) -> None:
+    """Refresh one logged-in EA Web App session and report the outcome."""
+    status = await message.answer(f"Refreshing account {account['email']}…")
+    session = await browser_pool.refresh_session(account["id"])
+    if session is None:
+        await status.edit_text(
+            f"Could not refresh account {account['email']}. "
+            "The EA browser session may need to be logged in again."
+        )
+        return
+    await status.edit_text(f"account {account['email']} refreshed")
+
+
+@router.message(Command("refresh"))
+async def cmd_refresh(message: Message, browser_pool: "BrowserPool") -> None:
+    accounts = await get_logged_in_accounts()
+    if not accounts:
+        await message.reply("No EA account is currently logged in.")
+        return
+
+    if len(accounts) == 1:
+        await _refresh_account(message, browser_pool, accounts[0])
+        return
+
+    await message.reply(
+        "Which account should be refreshed?",
+        reply_markup=refresh_account_picker_kb(accounts),
+    )
+
+
+@router.callback_query(F.data.startswith("refreshacc:"))
+async def cb_refresh_account(
+    callback: CallbackQuery, browser_pool: "BrowserPool"
+) -> None:
+    account_id = int(callback.data.split(":")[1])
+    account = await get_account_by_id(account_id)
+    if account is None or not account["is_logged_in"]:
+        await callback.answer("That account is no longer logged in.", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await _refresh_account(callback.message, browser_pool, account)
 
 
 _SHOT_FAIL_TEXT = (
@@ -1015,6 +1068,48 @@ async def cb_calculate_account(
 
 
 # ---------------------------------------------------------------------------
+# /take_on & /take_off — DSFUT polling on/off (full loop start/stop)
+# ---------------------------------------------------------------------------
+#
+# "Off" means the polling loop is not running at all — zero HTTP requests to
+# DSFUT — not merely a skipped pickup step. The state is in-memory only:
+# every bot restart defaults back to ON (per DSFUT_ENABLED).
+
+
+@router.message(Command("take_on"))
+async def cmd_take_on(message: Message, dsfut_manager: "DsfutPollerManager") -> None:
+    if not dsfut_manager.enabled_in_env:
+        await message.reply(
+            "⚠️ DSFUT is disabled in .env (DSFUT_ENABLED=false) — "
+            "enable it there and restart to use /take_on."
+        )
+        return
+    try:
+        started = await dsfut_manager.start()
+    except Exception:
+        logger.exception("Could not start DSFUT polling from /take_on")
+        await message.reply(
+            "❌ DSFUT could not be opened, so pickup did not start. "
+            "Check the DSFUT/Playwright error in the bot log and try /take_on again."
+        )
+        return
+    if started:
+        await message.reply("✅ DSFUT board opened — pickup polling is starting.")
+    else:
+        await message.reply("ℹ️ DSFUT pickup is already enabled and polling.")
+
+
+@router.message(Command("take_off"))
+async def cmd_take_off(message: Message, dsfut_manager: "DsfutPollerManager") -> None:
+    # stop() lets an in-flight poll cycle finish first, so this can take a
+    # few seconds when a request is mid-flight.
+    if await dsfut_manager.stop():
+        await message.reply("⛔ DSFUT pickup disabled — browser closed and polling stopped.")
+    else:
+        await message.reply("ℹ️ DSFUT pickup is already disabled; it is not polling.")
+
+
+# ---------------------------------------------------------------------------
 # /removeaccount {account_id}
 # ---------------------------------------------------------------------------
 
@@ -1164,7 +1259,7 @@ async def _proceed_with_order(
     await state.set_state(PlaceOrder.pick_account)
     await state.update_data(amount=amount, price_per_100k=price_per_100k)
     await send(
-        f"Order of <b>{amount:,}</b> coins — which account should process it?",
+        f"FC Web App order of <b>{amount:,}</b> coins — which logged-in account should search?",
         reply_markup=order_account_picker_kb(accounts),
     )
 
